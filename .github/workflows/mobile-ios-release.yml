@@ -1,0 +1,495 @@
+name: Mobile iOS Release
+run-name: iOS ${{ github.event.client_payload.ref || inputs.ref }} (${{ github.event.client_payload.target || inputs.target || 'production' }})
+
+on:
+  repository_dispatch:
+    types: [mobile-ios-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source repo ref/tag to build, e.g. mobile-v1.0.3'
+        required: true
+      target:
+        description: 'Release target'
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+      version:
+        description: 'Optional semver override, e.g. 1.0.3'
+        required: false
+      build_number:
+        description: 'Optional CFBundleVersion override. Must be higher than the last ASC upload.'
+        required: false
+      build_number_offset:
+        description: 'Offset added to the CI-resolved App Store Connect build number when build_number is empty.'
+        required: false
+        default: '0'
+      clear_cache:
+        description: 'Skip restoring GitHub build caches for this run and save fresh caches.'
+        required: true
+        default: false
+        type: boolean
+      submit:
+        description: 'Upload IPA to App Store Connect/TestFlight'
+        required: true
+        default: false
+        type: boolean
+      upload_private_release:
+        description: 'Upload IPA to the source repo GitHub Release'
+        required: true
+        default: true
+        type: boolean
+      what_to_test:
+        description: 'TestFlight What to Test notes'
+        required: false
+        default: 'Mobile app build'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ios-${{ github.event.client_payload.ref || inputs.ref }}-${{ github.event.client_payload.target || inputs.target || 'production' }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+  MOBILE_ARTIFACT_PREFIX: ${{ secrets.MOBILE_ARTIFACT_PREFIX }}
+  MOBILE_PLATFORM: ios
+  MOBILE_SOURCE_REF: ${{ github.event.client_payload.ref || github.event.client_payload.tag || inputs.ref }}
+  MOBILE_TARGET: ${{ github.event.client_payload.target || inputs.target || 'production' }}
+  MOBILE_VERSION: ${{ github.event.client_payload.version || inputs.version }}
+  MOBILE_BUILD_NUMBER: ${{ github.event.client_payload.build_number || inputs.build_number }}
+  MOBILE_BUILD_NUMBER_OFFSET: ${{ github.event.client_payload.build_number_offset || inputs.build_number_offset || '0' }}
+  CLEAR_CACHE: ${{ github.event.client_payload.clear_cache || inputs.clear_cache }}
+  SUBMIT_TO_STORE: ${{ github.event.client_payload.submit || inputs.submit }}
+  UPLOAD_PRIVATE_RELEASE: ${{ github.event.client_payload.upload_private_release || inputs.upload_private_release }}
+  IOS_TESTFLIGHT_CHANGELOG: ${{ github.event.client_payload.what_to_test || inputs.what_to_test || 'Mobile app build' }}
+  FEISHU_RELEASE_WEBHOOK_URL: ${{ vars.FEISHU_RELEASE_WEBHOOK_URL || secrets.FEISHU_RELEASE_WEBHOOK_URL }}
+  FEISHU_RELEASE_WEBHOOK_SECRET: ${{ secrets.FEISHU_RELEASE_WEBHOOK_SECRET || vars.FEISHU_RELEASE_WEBHOOK_SECRET }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      safe_ref: ${{ steps.resolve.outputs.safe_ref }}
+      platform: ${{ steps.resolve.outputs.platform }}
+      target: ${{ steps.resolve.outputs.target }}
+      version: ${{ steps.resolve.outputs.version }}
+      build_number: ${{ steps.resolve.outputs.build_number }}
+      release_env: ${{ steps.resolve.outputs.release_env }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      submit_to_store: ${{ steps.resolve.outputs.submit_to_store }}
+      upload_private_release: ${{ steps.resolve.outputs.upload_private_release }}
+      clear_cache: ${{ steps.resolve.outputs.clear_cache }}
+      artifact_name: ${{ steps.resolve.outputs.ios_artifact_name }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Resolve release inputs
+        id: resolve
+        env:
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          IOS_APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+        run: node scripts/resolve-mobile-release.mjs
+
+  build:
+    needs: prepare
+    runs-on: macos-26
+    timeout-minutes: 120
+    # 生产母包在 prebuild 和编译阶段共享 OTA 配置；Play 轨道不决定 OTA 渠道。
+    env:
+      OTTERMIND_OTA_ENABLED: ${{ needs.prepare.outputs.release_env == 'production' && '1' || '0' }}
+      OTTERMIND_OTA_TARGET: global
+      OTTERMIND_OTA_UPDATE_URL: https://u.expo.dev/d6f72c0c-f638-4b0b-8524-53df9b6a8838
+      EXPO_NO_DOTENV: '1'
+      EXPO_PUBLIC_APP_CHANNEL: production
+      EXPO_PUBLIC_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Validate source repo configuration
+        env:
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_REPO" || (echo "SOURCE_REPO secret is required" >&2; exit 1)
+          test -n "$SOURCE_REPO_PAT" || (echo "SOURCE_REPO_PAT secret is required" >&2; exit 1)
+
+      - name: Checkout source app
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          path: source
+
+      - name: Prepare shared mobile dependencies
+        uses: ./.github/actions/prepare-mobile
+        with:
+          platform: ios
+
+      - name: Load canonical production configuration
+        if: env.OTTERMIND_OTA_ENABLED == '1'
+        env:
+          OTA_CHANNEL: prod
+        run: node scripts/ota/setup-env.mjs "$OTA_CHANNEL"
+
+      - name: Setup Ruby for Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Print Apple toolchain version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve iOS cache keys
+        id: ios-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_fingerprint="$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+          xcode_hash="$(printf '%s' "$xcode_fingerprint" | shasum -a 256 | cut -d ' ' -f1)"
+          echo "xcode_hash=$xcode_hash" >> "$GITHUB_OUTPUT"
+          echo "run_suffix=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare iOS cache directories
+        run: |
+          mkdir -p \
+            "$HOME/.bun/install/cache" \
+            "$HOME/Library/Caches/CocoaPods" \
+            "$HOME/Library/Caches/org.swift.swiftpm" \
+            "$RUNNER_TEMP/ios-derived-data/SourcePackages"
+
+      - name: Validate Expo iOS toolchain
+        working-directory: source/apps/mobile
+        run: |
+          set -euo pipefail
+          REQUIRED_SWIFT_TOOLS="$(sed -n 's#// swift-tools-version: ##p' ../../node_modules/expo-modules-jsi/apple/Package.swift | head -1)"
+          echo "ExpoModulesJSI swift-tools-version=${REQUIRED_SWIFT_TOOLS:-unknown}"
+          if [ "$REQUIRED_SWIFT_TOOLS" = "6.2" ] && ! swift --version | grep -Eq 'Swift version (6\.[2-9]|[7-9]\.)'; then
+            echo "Swift 6.2+ is required by ExpoModulesJSI. Use a macOS/Xcode 26 runner." >&2
+            exit 1
+          fi
+
+      - name: Validate Sentry auth token
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: test -n "$SENTRY_AUTH_TOKEN" || (echo "SENTRY_AUTH_TOKEN secret is required for Sentry source map upload" >&2; exit 1)
+
+      - name: Restore App Store Connect API key
+        if: needs.prepare.outputs.submit_to_store == 'true'
+        shell: bash
+        env:
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$ASC_API_KEY_P8_BASE64" || (echo "ASC_API_KEY_P8_BASE64 is required" >&2; exit 1)
+          test -n "$ASC_KEY_ID" || (echo "ASC_KEY_ID is required" >&2; exit 1)
+          mkdir -p .private
+          printf '%s' "$ASC_API_KEY_P8_BASE64" | base64 --decode > ".private/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Update managed app version
+        run: node scripts/update-managed-app-version.mjs source/apps/mobile
+        env:
+          MOBILE_VERSION: ${{ needs.prepare.outputs.version }}
+
+      - name: Generate iOS native project
+        working-directory: source/apps/mobile
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: bunx expo prebuild --platform ios --clean --no-install
+
+      - name: Restore CocoaPods cache
+        if: needs.prepare.outputs.clear_cache != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            source/apps/mobile/ios/Pods
+          key: ios-pods-${{ runner.os }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile') }}-${{ steps.ios-cache.outputs.run_suffix }}
+          restore-keys: |
+            ios-pods-${{ runner.os }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile') }}-
+            ios-pods-${{ runner.os }}-
+
+      - name: Update iOS native version
+        working-directory: source/apps/mobile
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const version = process.env.MOBILE_VERSION;
+          const buildNumber = process.env.MOBILE_BUILD_NUMBER;
+          if (!/^\d+\.\d+\.\d+$/.test(version)) {
+            throw new Error(`Invalid MOBILE_VERSION: ${version}`);
+          }
+          if (!/^[1-9]\d*$/.test(buildNumber)) {
+            throw new Error(`Invalid MOBILE_BUILD_NUMBER: ${buildNumber}`);
+          }
+
+          function getPlistStringValue(plist, key) {
+            const match = plist.match(new RegExp(`<key>${key}</key>\\s*<string>([^<]*)</string>`));
+            return match?.[1] ?? null;
+          }
+
+          function replacePlistStringValue(plist, plistPath, key, value) {
+            const pattern = new RegExp(`(<key>${key}</key>\\s*<string>)([^<]*)(</string>)`);
+            if (!pattern.test(plist)) {
+              throw new Error(`${plistPath} ${key} was not found`);
+            }
+            return plist.replace(pattern, `$1${value}$3`);
+          }
+
+          const pbxprojPath = 'ios/Ottermind.xcodeproj/project.pbxproj';
+          let project = fs.readFileSync(pbxprojPath, 'utf8');
+          project = project.replace(/MARKETING_VERSION = [^;]+;/g, `MARKETING_VERSION = ${version};`);
+          project = project.replace(/CURRENT_PROJECT_VERSION = [^;]+;/g, `CURRENT_PROJECT_VERSION = ${buildNumber};`);
+          fs.writeFileSync(pbxprojPath, project);
+
+          for (const plistPath of ['ios/Ottermind/Info.plist', 'ios/OttermindExternalWidgetExtension/Info.plist']) {
+            if (!fs.existsSync(plistPath)) {
+              continue;
+            }
+            let plist = fs.readFileSync(plistPath, 'utf8');
+            plist = replacePlistStringValue(plist, plistPath, 'CFBundleShortVersionString', version);
+            plist = replacePlistStringValue(plist, plistPath, 'CFBundleVersion', buildNumber);
+            fs.writeFileSync(plistPath, plist);
+          }
+
+          for (const plistPath of ['ios/Ottermind/Info.plist', 'ios/OttermindExternalWidgetExtension/Info.plist']) {
+            if (!fs.existsSync(plistPath)) {
+              continue;
+            }
+            const plist = fs.readFileSync(plistPath, 'utf8');
+            const actualVersion = getPlistStringValue(plist, 'CFBundleShortVersionString');
+            const actualBuildNumber = getPlistStringValue(plist, 'CFBundleVersion');
+            if (actualVersion !== version) {
+              throw new Error(`${plistPath} CFBundleShortVersionString is ${actualVersion}, expected ${version}`);
+            }
+            if (actualBuildNumber !== buildNumber) {
+              throw new Error(`${plistPath} CFBundleVersion is ${actualBuildNumber}, expected ${buildNumber}`);
+            }
+          }
+
+          console.log(`[version] ios MARKETING_VERSION=${version} CURRENT_PROJECT_VERSION=${buildNumber}`);
+          NODE
+        env:
+          MOBILE_VERSION: ${{ needs.prepare.outputs.version }}
+          MOBILE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+
+      - name: Install iOS signing files
+        id: signing
+        env:
+          IOS_DISTRIBUTION_CERT_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERT_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          IOS_PROFILE_APP_BASE64: ${{ secrets.IOS_PROFILE_APP_BASE64 }}
+          IOS_PROFILE_WIDGET_BASE64: ${{ secrets.IOS_PROFILE_WIDGET_BASE64 }}
+        run: bash scripts/install-ios-signing.sh
+
+      - name: Install CocoaPods dependencies
+        working-directory: source/apps/mobile/ios
+        run: pod install
+
+      - name: Save CocoaPods cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            source/apps/mobile/ios/Pods
+          key: ios-pods-${{ runner.os }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile') }}-${{ steps.ios-cache.outputs.run_suffix }}
+
+      - name: Restore SwiftPM cache
+        if: needs.prepare.outputs.clear_cache != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ${{ runner.temp }}/ios-derived-data/SourcePackages
+          key: ios-spm-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/apps/mobile/ios/Podfile.lock') }}-${{ steps.ios-cache.outputs.run_suffix }}
+          restore-keys: |
+            ios-spm-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/apps/mobile/ios/Podfile.lock') }}-
+            ios-spm-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-
+
+      - name: Restore Xcode DerivedData cache
+        if: needs.prepare.outputs.clear_cache != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ios-derived-data
+          key: ios-derived-data-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile.lock') }}-${{ steps.ios-cache.outputs.run_suffix }}
+          restore-keys: |
+            ios-derived-data-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile.lock') }}-
+            ios-derived-data-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-
+
+      - name: Capture OTA runtime before compilation
+        if: env.OTTERMIND_OTA_ENABLED == '1'
+        env:
+          OTA_CHANNEL: prod
+        run: node scripts/ota/record.mjs snapshot source/apps/mobile ios "$OTA_CHANNEL" .private/ota-before.json
+
+      - name: Build signed IPA
+        env:
+          MOBILE_APP_ROOT: ${{ github.workspace }}/source/apps/mobile
+          IOS_OUTPUT_DIR: ${{ github.workspace }}/.private/artifacts
+          IOS_BUILD_LOG_DIR: ${{ runner.temp }}/gym-logs
+          IOS_DERIVED_DATA_PATH: ${{ runner.temp }}/ios-derived-data
+          IOS_XCODE_CLEAN: ${{ needs.prepare.outputs.clear_cache }}
+          IOS_OUTPUT_NAME: ${{ needs.prepare.outputs.artifact_name }}
+          IOS_PROFILE_APP_NAME: ${{ steps.signing.outputs.app_name }}
+          IOS_PROFILE_WIDGET_NAME: ${{ steps.signing.outputs.widget_name }}
+          IOS_PROJECT_NAME: ${{ secrets.IOS_PROJECT_NAME }}
+          IOS_SCHEME: ${{ secrets.IOS_SCHEME }}
+          IOS_APP_TARGET: ${{ secrets.IOS_APP_TARGET }}
+          IOS_WIDGET_TARGET: ${{ secrets.IOS_WIDGET_TARGET }}
+          IOS_APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+          IOS_WIDGET_BUNDLE_ID: ${{ secrets.IOS_WIDGET_BUNDLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          mkdir -p .private/artifacts "$IOS_BUILD_LOG_DIR" "$IOS_DERIVED_DATA_PATH"
+          bundle exec fastlane ios build_ipa
+
+      - name: Save SwiftPM cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ${{ runner.temp }}/ios-derived-data/SourcePackages
+          key: ios-spm-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/apps/mobile/ios/Podfile.lock') }}-${{ steps.ios-cache.outputs.run_suffix }}
+
+      - name: Save Xcode DerivedData cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ios-derived-data
+          key: ios-derived-data-${{ runner.os }}-${{ steps.ios-cache.outputs.xcode_hash }}-${{ hashFiles('source/bun.lock', 'source/apps/mobile/ios/Podfile.lock') }}-${{ steps.ios-cache.outputs.run_suffix }}
+
+      - name: Print iOS build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          for dir in "$RUNNER_TEMP/gym-logs" "$HOME/Library/Logs/gym"; do
+            [ -d "$dir" ] || continue
+            echo "::group::${dir}"
+            find "$dir" -type f -name '*.log' -print0 | while IFS= read -r -d '' file; do
+              echo "----- ${file}"
+              tail -n 240 "$file"
+            done
+            echo "::endgroup::"
+          done
+
+      - name: Upload iOS failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs-${{ needs.prepare.outputs.safe_ref }}-${{ needs.prepare.outputs.target }}
+          path: |
+            ${{ runner.temp }}/gym-logs
+            ~/Library/Logs/gym
+            source/apps/mobile/ios/build/generated/ios/Package.swift
+            source/apps/mobile/ios/Pods/Target Support Files/ExpoModulesJSI
+          if-no-files-found: ignore
+
+      - name: Verify actual binary and record OTA compatibility
+        if: env.OTTERMIND_OTA_ENABLED == '1'
+        env:
+          OTA_CHANNEL: prod
+          OTA_BINARY: .private/artifacts/${{ needs.prepare.outputs.artifact_name }}
+        run: node scripts/ota/record.mjs record source/apps/mobile ios "$OTA_CHANNEL" .private/ota-before.json "$OTA_BINARY"
+
+      - name: Save OTA build diagnostics
+        if: always() && env.OTTERMIND_OTA_ENABLED == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          include-hidden-files: true
+          name: ota-build-ios-production
+          path: |
+            .private/ota-before.json
+            .private/ota-after.json
+            .private/artifacts/*.ota.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload IPA to source repo release
+        if: needs.prepare.outputs.upload_private_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_PAT }}
+          OTA_BINARY: .private/artifacts/${{ needs.prepare.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          if [ "${{ needs.prepare.outputs.prerelease }}" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "${{ needs.prepare.outputs.safe_ref }}" \
+            -R "${{ env.SOURCE_REPO }}" \
+            --title "Mobile app ${{ needs.prepare.outputs.safe_ref }}" \
+            --notes "" \
+            ${prerelease_flag:+$prerelease_flag} \
+            || echo "Release already exists: ${{ needs.prepare.outputs.safe_ref }}"
+          gh release upload "${{ needs.prepare.outputs.safe_ref }}" \
+            ".private/artifacts/${{ needs.prepare.outputs.artifact_name }}" \
+            -R "${{ env.SOURCE_REPO }}" \
+            --clobber
+
+          if [ "$OTTERMIND_OTA_ENABLED" = "1" ]; then
+            gh release upload "${{ needs.prepare.outputs.safe_ref }}" "$OTA_BINARY.ota.json" -R "$SOURCE_REPO" --clobber
+          fi
+
+      - name: Upload IPA to App Store Connect/TestFlight
+        if: needs.prepare.outputs.submit_to_store == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_PATH: ${{ github.workspace }}/.private/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          IOS_IPA_PATH: ${{ github.workspace }}/.private/artifacts/${{ needs.prepare.outputs.artifact_name }}
+          IOS_APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+        run: bundle exec fastlane ios upload_testflight
+
+      - name: Cleanup signing files
+        if: always()
+        run: |
+          rm -rf .private
+          security delete-keychain "${{ steps.signing.outputs.keychain_path }}" || true
+
+  notify:
+    needs: [prepare, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Notify Feishu release bot
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_PLATFORM: ios
+          RELEASE_REF: ${{ needs.prepare.outputs.safe_ref || env.MOBILE_SOURCE_REF }}
+          RELEASE_TARGET: ${{ needs.prepare.outputs.target || env.MOBILE_TARGET }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version || env.MOBILE_VERSION }}
+          RELEASE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number || env.MOBILE_BUILD_NUMBER }}
+          RELEASE_ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact_name }}
+          RELEASE_SUBMIT_TO_STORE: ${{ needs.prepare.outputs.submit_to_store || env.SUBMIT_TO_STORE }}
+        run: node scripts/notify-feishu-release.mjs
