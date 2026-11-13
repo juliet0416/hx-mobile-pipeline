@@ -10,7 +10,7 @@ function createMobileFixture({
   appConfigVersion = '1.0.0',
   packageVersion = '1.0.0',
 } = {}) {
-  const root = mkdtempSync(path.join(tmpdir(), 'otter-managed-version-'));
+  const root = mkdtempSync(path.join(tmpdir(), 'managed-version-'));
   writeFileSync(
     path.join(root, 'package.json'),
     `${JSON.stringify({ name: 'mobile', version: packageVersion, private: true }, null, 2)}\n`,
@@ -19,7 +19,7 @@ function createMobileFixture({
     path.join(root, 'app.config.ts'),
     [
       'const config = {',
-      "  name: 'Ottermind',",
+      "  name: 'Example App',",
       `  version: '${appConfigVersion}',`,
       '};',
       'export default config;',
@@ -71,7 +71,7 @@ describe('update-managed-app-version', () => {
   test('fails clearly when app.config.ts has no literal version field', () => {
     const root = createMobileFixture();
     try {
-      writeFileSync(path.join(root, 'app.config.ts'), 'export default { name: "Ottermind" };\n');
+      writeFileSync(path.join(root, 'app.config.ts'), 'export default { name: "Example App" };\n');
 
       assert.throws(
         () => updateManagedAppVersion({ root, version: '1.0.9' }),

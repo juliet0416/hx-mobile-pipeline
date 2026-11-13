@@ -2,17 +2,17 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { capture, assertCompatible, pipelineRoot, updateUrl } from './runtime.mjs';
+import { capture, assertCompatible, pipelineRoot, otaUpdateUrl } from './runtime.mjs';
 
 //#region 真实安装包与构建记录绑定
 export function readBinary(file) {
   return JSON.parse(execFileSync('python3', [path.join(pipelineRoot, 'scripts/ota/read-binary.py'), file], { encoding: 'utf8' }));
 }
-export function assertBinary(snapshot, binary) {
+export function assertBinary(snapshot, binary, env = process.env) {
   for (const key of ['platform', 'channel', 'version', 'runtimeVersion']) {
     if (snapshot[key] !== binary[key]) throw new Error(`安装包 ${key} 与指纹记录不匹配：${binary[key]} / ${snapshot[key]}`);
   }
-  if (binary.updateUrl !== updateUrl) throw new Error('安装包 OTA URL 不匹配');
+  if (binary.updateUrl !== otaUpdateUrl(env)) throw new Error('安装包 OTA URL 不匹配');
   if (snapshot.artifact && (snapshot.artifact.sha256 !== binary.sha256 || snapshot.artifact.name !== binary.name)) throw new Error('安装包 SHA256 / 文件名与构建记录不匹配');
 }
 export async function record(app, platform, channel, beforeFile, binaryFile) {

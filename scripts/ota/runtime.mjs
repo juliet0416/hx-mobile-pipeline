@@ -8,29 +8,79 @@ import { fileURLToPath } from 'node:url';
 //#region 共用环境与发布输入
 export const pipelineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const toolchain = JSON.parse(readFileSync(new URL('./toolchain.json', import.meta.url)));
-export const updateUrl = 'https://u.expo.dev/d6f72c0c-f638-4b0b-8524-53df9b6a8838';
-export function productionEnv(channel) {
+
+// OTA 的环境变量名由 App 约定，流水线只负责拼装前缀（例如 `APP_OTA_ENABLED`）。
+export function otaEnvPrefix(env = process.env) {
+  const value = env.OTA_ENV_PREFIX?.trim();
+  if (!value || !/^[A-Z][A-Z0-9_]*_$/.test(value)) {
+    throw new Error('OTA_ENV_PREFIX 必填，形如 `<APP>_`（需与源码 App 的 OTA 环境变量前缀一致）');
+  }
+  return value;
+}
+
+export function otaEnvName(key, env = process.env) {
+  return `${otaEnvPrefix(env)}${key}`;
+}
+
+export function otaUpdateUrl(env = process.env) {
+  const raw = env.OTA_UPDATE_URL?.trim();
+  if (!raw) throw new Error('OTA_UPDATE_URL 必填（Expo 更新地址，需与安装包一致）');
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('OTA_UPDATE_URL 不是合法 URL');
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('OTA_UPDATE_URL 必须是无凭证、无 query/fragment 的 HTTPS 地址');
+  }
+  return url.toString();
+}
+
+const OTA_SETTINGS = [
+  'OTA_UPDATE_URL',
+  'OTA_APP_TITLE',
+  'OTA_APP_ID',
+  'OTA_API_BASE_URL',
+  'OTA_CN_API_BASE_URL',
+  'OTA_WWW_URL',
+  'OTA_STUDIO_URL',
+  'OTA_TARGET_GLOBAL',
+  'OTA_TARGET_CN',
+];
+
+export function productionEnv(channel, env = process.env) {
   if (!['prod', 'cn-prod'].includes(channel)) throw new Error('Invalid production channel');
   const cn = channel === 'cn-prod';
+  const missing = OTA_SETTINGS.filter((key) => !env[key]?.trim());
+  if (missing.length > 0) throw new Error(`缺少 OTA 配置：${missing.join(', ')}`);
+  const prefix = otaEnvPrefix(env);
+
   return {
     EXPO_NO_DOTENV: '1', NODE_ENV: 'production', CI: '1',
     EXPO_PUBLIC_APP_CHANNEL: 'production', EXPO_PUBLIC_RELEASE_ENV: 'production',
-    EXPO_PUBLIC_REGION: cn ? 'cn' : 'global', EXPO_PUBLIC_APP_TITLE: 'Ottermind',
-    EXPO_PUBLIC_APP_ID: 'ai.ottermind.mobile',
-    EXPO_PUBLIC_API_BASE_URL: cn ? 'https://api.ottermind.cn' : 'https://api.ottermind.ai',
-    EXPO_PUBLIC_WWW_URL: 'https://ottermind.ai', EXPO_PUBLIC_STUDIO_URL: 'https://ottermind.ai/studio',
-    OTTERMIND_WORKLETS_BUNDLE_MODE: '0', OTTERMIND_OTA_ENABLED: '1',
-    OTTERMIND_OTA_TARGET: cn ? 'cn-apk' : 'global', OTTERMIND_OTA_UPDATE_URL: updateUrl,
+    EXPO_PUBLIC_REGION: cn ? 'cn' : 'global',
+    EXPO_PUBLIC_APP_TITLE: env.OTA_APP_TITLE.trim(),
+    EXPO_PUBLIC_APP_ID: env.OTA_APP_ID.trim(),
+    EXPO_PUBLIC_API_BASE_URL: (cn ? env.OTA_CN_API_BASE_URL : env.OTA_API_BASE_URL).trim(),
+    EXPO_PUBLIC_WWW_URL: env.OTA_WWW_URL.trim(),
+    EXPO_PUBLIC_STUDIO_URL: env.OTA_STUDIO_URL.trim(),
+    [`${prefix}WORKLETS_BUNDLE_MODE`]: '0',
+    [`${prefix}OTA_ENABLED`]: '1',
+    [`${prefix}OTA_TARGET`]: (cn ? env.OTA_TARGET_CN : env.OTA_TARGET_GLOBAL).trim(),
+    [`${prefix}OTA_UPDATE_URL`]: otaUpdateUrl(env),
     // 使用显式配置，避免 EAS profile / 本机交互预设覆盖母包环境。
-    OTTERMIND_OTA_ENV: '', EAS_BUILD_PROFILE: '',
+    [`${prefix}OTA_ENV`]: '',
+    EAS_BUILD_PROFILE: '',
   };
 }
-export function validateInputs(input) {
+
+export function validateInputs(input, env = process.env) {
   if (!/^[a-f0-9]{40}$/.test(input.ref ?? '')) throw new Error('补丁 ref 必须是完整的 40 位 Git commit SHA');
   if (!['ios', 'android'].includes(input.platform)) throw new Error('Invalid platform');
-  productionEnv(input.channel);
+  productionEnv(input.channel, env);
   if (input.channel === 'cn-prod' && input.platform !== 'android') throw new Error('cn-prod 只支持 Android');
-  if (!/^mobile-v\d+\.\d+\.\d+$/.test(input.release ?? '')) throw new Error('Invalid release tag');
+  if (!String(input.release ?? '').trim()) throw new Error('release tag 不能为空');
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.(apk|aab|ipa)$/.test(input.artifact ?? '')) throw new Error('必须指定完整安装包文件名，不支持通配符或路径');
   if ((input.platform === 'ios') !== input.artifact.endsWith('.ipa')) throw new Error('安装包与平台不匹配');
   const message = (input.message ?? '').replace(/\r\n?/g, '\n').trim();
@@ -43,7 +93,13 @@ export function validateInputs(input) {
 //#region 指纹记录与兼容性检查
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 export function recipeHash() {
-  return sha256(['scripts/ota/toolchain.json', 'scripts/ota/prepare-native.mjs', 'scripts/ota/runtime.mjs', '.github/actions/prepare-mobile/action.yml']
+  return sha256([
+    'scripts/ota/toolchain.json',
+    'scripts/ota/runtime.mjs',
+    'scripts/native/prepare-native.mjs',
+    'scripts/native/runtime.mjs',
+    '.github/actions/prepare-mobile/action.yml',
+  ]
     .map(file => `${file}\0${readFileSync(path.join(pipelineRoot, file), 'utf8')}`).join('\0'));
 }
 export function summarizeSources(sources) {
@@ -73,10 +129,11 @@ export async function capture(appRoot, platform, channel) {
   try {
     if (!['ios', 'android'].includes(platform)) throw new Error('Invalid platform');
     Object.assign(process.env, productionEnv(channel));
+    const expectedUpdateUrl = otaUpdateUrl();
     const require = createRequire(path.join(appRoot, 'package.json'));
     const { getConfig } = require('expo/config');
     const { exp } = getConfig(appRoot, { isPublicConfig: true });
-    if (exp.runtimeVersion?.policy !== 'fingerprint' || !exp.updates?.enabled || exp.updates.url !== updateUrl || exp.updates.requestHeaders?.['expo-channel-name'] !== channel) {
+    if (exp.runtimeVersion?.policy !== 'fingerprint' || !exp.updates?.enabled || exp.updates.url !== expectedUpdateUrl || exp.updates.requestHeaders?.['expo-channel-name'] !== channel) {
       throw new Error('App 未启用预期的 fingerprint / OTA URL / channel');
     }
     const updatesRoot = path.dirname(require.resolve('expo-updates/package.json'));

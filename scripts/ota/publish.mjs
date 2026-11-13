@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { pipelineRoot, productionEnv, capture, assertCompatible, toolchain } from './runtime.mjs';
+import { pipelineRoot, productionEnv, otaEnvName, capture, assertCompatible, toolchain } from './runtime.mjs';
 
 //#region 发布阶段：校验、导出、再次校验，再上传同一份产物
 export async function publishChecked({ input, baseline, snapshot, exportBundle, publishBundle }) {
@@ -25,8 +25,9 @@ export async function main() {
   for (const [key, expected] of Object.entries(env)) {
     if (process.env[key] !== undefined && process.env[key] !== expected) throw new Error(`EAS production 环境变量 ${key} 与 ${input.channel} 不一致，请移除冲突配置`);
   }
-  if (process.env.OTTERMIND_OTA_RELEASE_NOTES) throw new Error('请移除 EAS 环境中的 OTTERMIND_OTA_RELEASE_NOTES，更新说明由本次发布输入提供');
-  Object.assign(process.env, env, { OTTERMIND_OTA_RELEASE_NOTES: input.message, EXPO_NO_GIT_STATUS: '1' });
+  const releaseNotesKey = otaEnvName('OTA_RELEASE_NOTES');
+  if (process.env[releaseNotesKey]) throw new Error(`请移除 EAS 环境中的 ${releaseNotesKey}，更新说明由本次发布输入提供`);
+  Object.assign(process.env, env, { [releaseNotesKey]: input.message, EXPO_NO_GIT_STATUS: '1' });
   if (execFileSync('git', ['rev-parse', 'HEAD'], { cwd: app, encoding: 'utf8' }).trim() !== input.ref) throw new Error('实际检出提交与输入不符');
   if (process.versions.node !== toolchain.node || execFileSync('bun', ['--version'], { encoding: 'utf8' }).trim() !== toolchain.bun) throw new Error('工具链版本不符');
   const require = createRequire(path.join(app, 'package.json'));

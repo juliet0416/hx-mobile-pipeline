@@ -34,13 +34,10 @@ test('does not silently normalize a changed dependency version or unexpected man
   writeFileSync(manifest, original.replace('org.reactnative.maskedview', 'unexpected.package'));
   assert.throws(() => prepareAndroidManifest(root), /Manifest/);
 }));
-test('binary and OTA workflows normalize before any runtime capture or export; iOS is excluded', () => {
-  const build = readFileSync(new URL('../../.github/workflows/mobile-android-release.yml', import.meta.url), 'utf8');
+test('OTA workflow normalizes before runtime capture; iOS is excluded', () => {
   const ota = readFileSync(new URL('../../.github/workflows/mobile-ota-update.yml', import.meta.url), 'utf8');
   const ios = readFileSync(new URL('../../.github/workflows/mobile-ios-release.yml', import.meta.url), 'utf8');
   const call = 'node scripts/ota/prepare-android.mjs source';
-  assert.ok(build.indexOf(call) > build.indexOf('uses: ./.github/actions/prepare-mobile'));
-  assert.ok(build.indexOf(call) < build.indexOf('Capture OTA runtime before compilation'));
   assert.ok(ota.indexOf(call) > ota.indexOf('uses: ./.github/actions/prepare-mobile'));
   assert.ok(ota.indexOf(call) < ota.indexOf('Load canonical production configuration'));
   assert.match(ota, /name: Normalize Android dependency manifest\n\s+if: inputs.platform == 'android'\n\s+run: node scripts\/ota\/prepare-android.mjs source/);

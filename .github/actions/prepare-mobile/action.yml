@@ -1,9 +1,9 @@
 name: Prepare reproducible mobile dependencies
-description: Clean locked install and verified native archives for both binaries and OTA
+description: Clean locked install and verified native prebuilts
 inputs:
   platform:
     required: true
-    description: ios or android
+    description: android or ios
   source:
     default: source
     description: Fresh source checkout path
@@ -16,7 +16,7 @@ runs:
       run: |
         node - <<'NODE'
         const fs = require('fs');
-        const tools = JSON.parse(fs.readFileSync('scripts/ota/toolchain.json'));
+        const tools = JSON.parse(fs.readFileSync('scripts/native/toolchain.json'));
         fs.appendFileSync(process.env.GITHUB_OUTPUT, `node=${tools.node}\nbun=${tools.bun}\n`);
         NODE
     - uses: oven-sh/setup-bun@v2
@@ -41,4 +41,5 @@ runs:
       env:
         SOURCE_DIR: ${{ inputs.source }}
         NATIVE_PLATFORM: ${{ inputs.platform }}
-      run: node scripts/ota/prepare-native.mjs "$SOURCE_DIR" "$NATIVE_PLATFORM"
+      run: node scripts/native/prepare-native.mjs "$SOURCE_DIR" "$NATIVE_PLATFORM"
+

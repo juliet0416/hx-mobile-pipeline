@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       release:
-        description: '目标安装包的 Release tag，例如 mobile-v1.4.8'
+        description: '目标安装包的 Release tag（Release 中需包含同名安装包与 .ota.json）'
         required: true
         type: string
       artifact:
@@ -44,9 +44,20 @@ jobs:
     runs-on: ${{ inputs.platform == 'ios' && 'macos-26' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
-      SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+      SOURCE_REPO: ${{ vars.SOURCE_REPO || secrets.SOURCE_REPO }}
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
+      # OTA 配置由仓库变量提供；必须与目标安装包构建时的配置一致。
+      OTA_ENV_PREFIX: ${{ vars.OTA_ENV_PREFIX }}
+      OTA_UPDATE_URL: ${{ vars.OTA_UPDATE_URL }}
+      OTA_APP_TITLE: ${{ vars.OTA_APP_TITLE }}
+      OTA_APP_ID: ${{ vars.OTA_APP_ID }}
+      OTA_API_BASE_URL: ${{ vars.OTA_API_BASE_URL }}
+      OTA_CN_API_BASE_URL: ${{ vars.OTA_CN_API_BASE_URL }}
+      OTA_WWW_URL: ${{ vars.OTA_WWW_URL }}
+      OTA_STUDIO_URL: ${{ vars.OTA_STUDIO_URL }}
+      OTA_TARGET_GLOBAL: ${{ vars.OTA_TARGET_GLOBAL }}
+      OTA_TARGET_CN: ${{ vars.OTA_TARGET_CN }}
     steps:
       - name: Checkout pipeline
         uses: actions/checkout@v4
@@ -134,7 +145,6 @@ jobs:
       - name: Check, export and optionally publish
         working-directory: source/apps/mobile
         env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: eas env:exec production 'node "$GITHUB_WORKSPACE/scripts/ota/publish.mjs"' --non-interactive
       - name: Upload compatibility diagnostics

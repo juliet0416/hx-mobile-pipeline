@@ -1,0 +1,409 @@
+name: Android APK Release
+
+run-name: Android APK ${{ github.event.client_payload.ref || inputs.ref }} · ${{ github.event.client_payload.target || inputs.target }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '源码仓库 ref（branch/tag/commit）'
+        required: true
+        type: string
+      target:
+        description: '构建目标'
+        required: true
+        default: global
+        type: choice
+        options:
+          - cn
+          - global
+      release_env:
+        description: '运行时后端环境'
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - test
+      version:
+        description: '可选 semver 覆盖；留空读取源码 app.config.ts'
+        required: false
+        type: string
+      build_number:
+        description: '可选 versionCode；留空按分钟单调生成'
+        required: false
+        type: string
+      build_number_offset:
+        description: '自动 versionCode 上追加的偏移'
+        required: false
+        default: '0'
+        type: string
+      api_base_url:
+        description: '可选：覆盖 API 地址（cn 目标必须提供）'
+        required: false
+        type: string
+      www_url:
+        description: '可选：覆盖 Web 站点地址'
+        required: false
+        type: string
+      studio_url:
+        description: '可选：覆盖 Studio 地址'
+        required: false
+        type: string
+      upload_release:
+        description: '构建完成后创建 GitHub Release 并上传 APK'
+        required: true
+        default: true
+        type: boolean
+  repository_dispatch:
+    types: [android-apk-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.event.client_payload.ref || inputs.ref }}-${{ github.event.client_payload.target || inputs.target }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: ${{ vars.SOURCE_REPO || secrets.SOURCE_REPO }}
+  MOBILE_PLATFORM: android
+  MOBILE_SOURCE_REF: ${{ github.event.client_payload.ref || inputs.ref }}
+  MOBILE_TARGET: ${{ github.event.client_payload.target || inputs.target || 'global' }}
+  MOBILE_RELEASE_ENV: ${{ github.event.client_payload.release_env || inputs.release_env || 'production' }}
+  MOBILE_VERSION: ${{ github.event.client_payload.version || inputs.version }}
+  MOBILE_BUILD_NUMBER: ${{ github.event.client_payload.build_number || inputs.build_number }}
+  MOBILE_BUILD_NUMBER_OFFSET: ${{ github.event.client_payload.build_number_offset || inputs.build_number_offset || '0' }}
+  MOBILE_API_BASE_URL: ${{ github.event.client_payload.api_base_url || inputs.api_base_url }}
+  MOBILE_WWW_URL: ${{ github.event.client_payload.www_url || inputs.www_url || vars.MOBILE_WWW_URL }}
+  MOBILE_STUDIO_URL: ${{ github.event.client_payload.studio_url || inputs.studio_url || vars.MOBILE_STUDIO_URL }}
+  MOBILE_CN_API_BASE_URL: ${{ vars.MOBILE_CN_API_BASE_URL }}
+  MOBILE_GLOBAL_API_BASE_URL: ${{ vars.MOBILE_GLOBAL_API_BASE_URL }}
+  MOBILE_ARTIFACT_PREFIX: ${{ vars.MOBILE_ARTIFACT_PREFIX || 'mobile-app' }}
+  RELEASE_TAG_PREFIX: ${{ vars.RELEASE_TAG_PREFIX }}
+  UPLOAD_RELEASE: ${{ github.event.client_payload.upload_release == false && 'false' || (github.event.client_payload.upload_release == true && 'true' || inputs.upload_release) }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      target: ${{ steps.resolve.outputs.target }}
+      release_env: ${{ steps.resolve.outputs.release_env }}
+      region: ${{ steps.resolve.outputs.region }}
+      api_base_url: ${{ steps.resolve.outputs.api_base_url }}
+      www_url: ${{ steps.resolve.outputs.www_url }}
+      studio_url: ${{ steps.resolve.outputs.studio_url }}
+      version: ${{ steps.resolve.outputs.version }}
+      build_number: ${{ steps.resolve.outputs.build_number }}
+      signing_mode: ${{ steps.keystore.outputs.signing_mode }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Read pinned toolchain
+        id: tools
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const tools = JSON.parse(fs.readFileSync('scripts/native/toolchain.json'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `node=${tools.node}\n`);
+          NODE
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+
+      - name: Run pipeline unit tests
+        run: node --test "scripts/**/*.test.mjs"
+
+      - name: Resolve release inputs
+        id: resolve
+        run: node scripts/resolve-release.mjs
+
+      - name: Setup Java for keytool
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android signing keystore
+        id: keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: node scripts/prepare-signing-keystore.mjs generate .private/signing
+
+      - name: Upload temporary signing keystore
+        if: steps.keystore.outputs.signing_mode == 'temp'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-signing
+          path: .private/signing/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      EXPO_NO_DOTENV: '1'
+      EXPO_PUBLIC_APP_CHANNEL: production
+      EXPO_PUBLIC_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
+      EXPO_PUBLIC_REGION: ${{ needs.prepare.outputs.region }}
+      EXPO_PUBLIC_API_BASE_URL: ${{ needs.prepare.outputs.api_base_url }}
+      EXPO_PUBLIC_WWW_URL: ${{ needs.prepare.outputs.www_url }}
+      EXPO_PUBLIC_STUDIO_URL: ${{ needs.prepare.outputs.studio_url }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Validate source repo configuration
+        env:
+          SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          test -n "${SOURCE_REPO:-}" || { echo "SOURCE_REPO 未配置（仓库 variable 或 secret）" >&2; exit 1; }
+          test -n "${SOURCE_REPO_PAT:-}" || { echo "SOURCE_REPO_PAT secret 必填（用于读取源码仓库）" >&2; exit 1; }
+
+      - name: Checkout source app
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+          path: source
+          fetch-depth: 1
+
+      - name: Prepare shared mobile dependencies
+        uses: ./.github/actions/prepare-mobile
+        with:
+          platform: android
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          cache-cleanup: on-success
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Restore Firebase config for app config resolution (optional)
+        if: needs.prepare.outputs.target == 'global'
+        shell: bash
+        env:
+          GOOGLE_SERVICES_PROD_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_PROD_JSON_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GOOGLE_SERVICES_PROD_JSON_BASE64:-}" ]; then
+            echo "GOOGLE_SERVICES_PROD_JSON_BASE64 未配置；本目标将不带 FCM 配置"
+            exit 0
+          fi
+          mkdir -p source/apps/mobile/secrets
+          printf '%s' "$GOOGLE_SERVICES_PROD_JSON_BASE64" | base64 --decode > source/apps/mobile/secrets/google-services-prod.json
+
+      - name: Resolve app version and artifact name
+        env:
+          BUILD_PLATFORM: android
+          BUILD_TARGET: ${{ needs.prepare.outputs.target }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: node scripts/prepare-build-env.mjs
+
+      - name: Generate Android native project
+        working-directory: source/apps/mobile
+        run: bunx expo prebuild --platform android --clean --no-install
+
+      - name: Download temporary signing keystore
+        if: needs.prepare.outputs.signing_mode == 'temp'
+        uses: actions/download-artifact@v4
+        with:
+          name: android-signing
+          path: .private/signing
+
+      - name: Restore Android signing keystore
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: node scripts/prepare-signing-keystore.mjs restore source/apps/mobile/android/app/ci-upload.keystore
+
+      - name: Restore Firebase config into native project (optional)
+        if: needs.prepare.outputs.target == 'global'
+        shell: bash
+        env:
+          GOOGLE_SERVICES_PROD_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_PROD_JSON_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GOOGLE_SERVICES_PROD_JSON_BASE64:-}" ]; then
+            exit 0
+          fi
+          cp source/apps/mobile/secrets/google-services-prod.json source/apps/mobile/android/app/google-services.json
+
+      - name: Update Android native version
+        run: node scripts/set-android-version.mjs source/apps/mobile/android/app/build.gradle
+
+      - name: Configure Android release signing
+        run: node scripts/configure-android-signing.mjs source/apps/mobile/android/app/build.gradle
+
+      - name: Build Android APK
+        working-directory: source/apps/mobile/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect Android artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .private/artifacts
+          shopt -s nullglob
+          files=( source/apps/mobile/android/app/build/outputs/apk/release/*.apk )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有找到 APK 产物，构建输出如下：" >&2
+            find source/apps/mobile/android/app/build/outputs -type f | sort || true
+            exit 1
+          fi
+          printf 'APK candidates:\n'; printf '  %s\n' "${files[@]}"
+
+          chosen=""
+          for file in "${files[@]}"; do
+            if [ "$(basename "$file")" = "app-release.apk" ]; then chosen="$file"; fi
+          done
+          [ -n "$chosen" ] || chosen="${files[0]}"
+
+          destination=".private/artifacts/${ARTIFACT_NAME}"
+          cp "$chosen" "$destination"
+          digest=$(sha256sum "$destination" | awk '{print $1}')
+          size=$(stat -c %s "$destination")
+          printf '%s  %s\n' "$digest" "$ARTIFACT_NAME" > ".private/artifacts/${BUILD_TARGET}.sha256"
+
+          TARGET="$BUILD_TARGET" VERSION="$BUILD_VERSION" BUILD_NUMBER="$BUILD_NUMBER" \
+          ARTIFACT_NAME="$ARTIFACT_NAME" SHA256="$digest" SIZE="$size" \
+          SIGNING_MODE="${{ needs.prepare.outputs.signing_mode }}" REGION="${{ needs.prepare.outputs.region }}" \
+          API_BASE_URL="${{ needs.prepare.outputs.api_base_url }}" RELEASE_ENV="${{ needs.prepare.outputs.release_env }}" \
+          SOURCE_REF="${{ needs.prepare.outputs.source_ref }}" SOURCE_REPO="$SOURCE_REPO" \
+          node - <<'NODE'
+          const fs = require('fs');
+          const summary = {
+            platform: 'android',
+            target: process.env.TARGET,
+            version: process.env.VERSION,
+            buildNumber: process.env.BUILD_NUMBER,
+            artifactName: process.env.ARTIFACT_NAME,
+            sha256: process.env.SHA256,
+            sizeBytes: Number(process.env.SIZE),
+            signingMode: process.env.SIGNING_MODE,
+            region: process.env.REGION,
+            apiBaseUrl: process.env.API_BASE_URL,
+            releaseEnv: process.env.RELEASE_ENV,
+            sourceRepo: process.env.SOURCE_REPO,
+            sourceRef: process.env.SOURCE_REF,
+          };
+          fs.writeFileSync(`.private/artifacts/${process.env.TARGET}.json`, `${JSON.stringify(summary, null, 2)}\n`);
+          NODE
+
+          ls -lh .private/artifacts
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ needs.prepare.outputs.target }}
+          path: .private/artifacts/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup secret files
+        if: always()
+        run: |
+          rm -rf .private/signing
+          rm -f source/apps/mobile/android/app/ci-upload.keystore
+          rm -f source/apps/mobile/android/app/google-services.json
+          rm -f source/apps/mobile/secrets/google-services-prod.json
+
+  finish:
+    needs: [prepare, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_url: ${{ steps.release.outputs.release_url }}
+      tag: ${{ steps.release.outputs.tag }}
+      uploaded: ${{ steps.release.outputs.uploaded }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Download APK artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apk-*
+          path: .private/artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_RELEASE: ${{ env.UPLOAD_RELEASE }}
+          RELEASE_SUMMARIES_DIR: .private/artifacts
+          RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          RELEASE_REF: ${{ needs.prepare.outputs.source_ref }}
+          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
+          RELEASE_EXPECTED_TARGETS: ${{ needs.prepare.outputs.target }}
+          RELEASE_TAG_PREFIX: ${{ env.RELEASE_TAG_PREFIX }}
+        run: node scripts/publish-release.mjs
+
+  notify:
+    needs: [prepare, build, finish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Download APK artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apk-*
+          path: .private/artifacts
+          merge-multiple: true
+
+      - name: Notify Feishu release bot
+        env:
+          FEISHU_RELEASE_WEBHOOK_URL: ${{ secrets.FEISHU_RELEASE_WEBHOOK_URL || vars.FEISHU_RELEASE_WEBHOOK_URL }}
+          FEISHU_RELEASE_WEBHOOK_SECRET: ${{ secrets.FEISHU_RELEASE_WEBHOOK_SECRET || vars.FEISHU_RELEASE_WEBHOOK_SECRET }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_PLATFORM: android
+          RELEASE_REF: ${{ needs.prepare.outputs.source_ref || env.MOBILE_SOURCE_REF }}
+          RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version || env.MOBILE_VERSION }}
+          RELEASE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number || env.MOBILE_BUILD_NUMBER }}
+          RELEASE_TARGETS: ${{ needs.prepare.outputs.target || env.MOBILE_TARGET }}
+          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env || env.MOBILE_RELEASE_ENV }}
+          RELEASE_SIGNING_MODE: ${{ needs.prepare.outputs.signing_mode }}
+          RELEASE_URL: ${{ needs.finish.outputs.release_url }}
+          RELEASE_TAG: ${{ needs.finish.outputs.tag }}
+          RELEASE_UPLOADED: ${{ needs.finish.outputs.uploaded }}
+          RELEASE_PIPELINE_REPO: ${{ github.repository }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_SUMMARIES_DIR: .private/artifacts
+        run: node scripts/notify-feishu-release.mjs

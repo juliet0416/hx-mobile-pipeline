@@ -2,11 +2,9 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const gradlePath = resolve(process.argv[2] ?? 'source/apps/mobile/android/app/build.gradle');
-let text = readFileSync(gradlePath, 'utf8');
-
-const releaseSigningBlock = [
+const RELEASE_SIGNING_BLOCK = [
   '        release {',
   '            def requiredSigningProps = [',
   "                'CI_UPLOAD_STORE_FILE',",
@@ -26,29 +24,47 @@ const releaseSigningBlock = [
   '        }',
 ].join('\n');
 
-if (!text.includes('signingConfigs {')) {
-  throw new Error(`Cannot find signingConfigs block in ${gradlePath}`);
-}
+const DEBUG_BLOCK = [
+  '        debug {',
+  "            storeFile file('debug.keystore')",
+  "            storePassword 'android'",
+  "            keyAlias 'androiddebugkey'",
+  "            keyPassword 'android'",
+  '        }',
+].join('\n');
 
-if (!text.includes('CI_UPLOAD_STORE_FILE')) {
-  const debugBlock = `        debug {
-            storeFile file('debug.keystore')
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
-        }`;
-
-  if (!text.includes(debugBlock)) {
-    throw new Error(`Cannot find expected debug signing block in ${gradlePath}`);
+export function configureReleaseSigning(text) {
+  if (!text.includes('signingConfigs {')) {
+    throw new Error('Cannot find signingConfigs block in build.gradle');
   }
 
-  text = text.replace(debugBlock, `${debugBlock}\n${releaseSigningBlock}`);
+  let next = text;
+  if (!next.includes('CI_UPLOAD_STORE_FILE')) {
+    if (!next.includes(DEBUG_BLOCK)) {
+      throw new Error('Cannot find expected debug signing block in build.gradle');
+    }
+    next = next.replace(DEBUG_BLOCK, `${DEBUG_BLOCK}\n${RELEASE_SIGNING_BLOCK}`);
+  }
+
+  const withRelease = next.replace(/signingConfig signingConfigs\.debug/g, 'signingConfig signingConfigs.release');
+  if (withRelease === next && !next.includes('signingConfig signingConfigs.release')) {
+    throw new Error('Cannot replace release signingConfig in build.gradle');
+  }
+  return withRelease;
 }
 
-const next = text.replace(/signingConfig signingConfigs\.debug/g, 'signingConfig signingConfigs.release');
-if (next === text && !text.includes('signingConfig signingConfigs.release')) {
-  throw new Error(`Cannot replace release signingConfig in ${gradlePath}`);
+function main() {
+  const gradlePath = resolve(process.argv[2] ?? 'source/apps/mobile/android/app/build.gradle');
+  const text = readFileSync(gradlePath, 'utf8');
+  writeFileSync(gradlePath, configureReleaseSigning(text));
+  console.log(`[android-signing] configured release signing in ${gradlePath}`);
 }
 
-writeFileSync(gradlePath, next);
-console.log(`[android-signing] configured release signing in ${gradlePath}`);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`[android-signing] ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
