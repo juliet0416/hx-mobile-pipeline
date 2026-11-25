@@ -34,13 +34,12 @@ test('stores a signed APK privately and reuses a verified copy after an overwrit
   try {
     const artifactName = 'app.apk';
     const sha256 = 'a'.repeat(64);
-    const tag = 'test-android-v1.0.0-1';
     writeFileSync(path.join(dir, artifactName), 'bytes');
     const opts = {
       settings: { bucket: 'example-mobile', region: 'cn-zhangjiakou', prefix: 'private/mobile' },
-      releaseEnv: 'test', platform: 'android', tag, entries: [{ artifactName, sha256 }], dir,
+      platform: 'android', entries: [{ artifactName, sha256 }], dir,
     };
-    const key = `private/mobile/test/android/${tag}/${sha256}/app.apk`;
+    const key = 'private/mobile/appupdate/app.apk';
     const url = 'https://example.invalid/short-lived-url';
     const client = {
       async put(name, file, options) {
@@ -82,7 +81,7 @@ test('uploads large artifacts in private parts and verifies the completed object
     truncateSync(filePath, size);
     const options = {
       settings: { bucket: 'example-mobile', region: 'cn-zhangjiakou', prefix: 'private/mobile' },
-      dir, releaseEnv: 'test', platform: 'android', tag: 'test-android-v1.0.0-1',
+      dir, platform: 'android',
       entries: [{ artifactName, sha256 }],
     };
     let aborted;

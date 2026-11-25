@@ -246,7 +246,7 @@ jobs:
           test -f "$source_path" || { echo "没有找到 IPA：$source_path" >&2; find .private/artifacts -type f | sort; exit 1; }
           digest=$(shasum -a 256 "$source_path" | awk '{print $1}')
           size=$(stat -f%z "$source_path")
-          printf '%s  %s\n' "$digest" "$ARTIFACT_NAME" > ".private/artifacts/${BUILD_TARGET}.sha256"
+          printf '%s  %s\n' "$digest" "$ARTIFACT_NAME" > ".private/artifacts/${ARTIFACT_NAME}.sha256"
 
           TARGET="$BUILD_TARGET" VERSION="$BUILD_VERSION" BUILD_NUMBER="$BUILD_NUMBER" \
           ARTIFACT_NAME="$ARTIFACT_NAME" SHA256="$digest" SIZE="$size" \

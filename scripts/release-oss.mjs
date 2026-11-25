@@ -2,7 +2,6 @@ import { statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
-export const OSS_DOWNLOAD_MANIFEST = 'oss-download.json';
 const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
 const MULTIPART_PART_SIZE = 8 * 1024 * 1024;
 
@@ -110,20 +109,19 @@ export async function describeOssObject({ client, key, artifactName, sha256, siz
   }
 }
 
-export async function backupToOss({ settings, releaseEnv, platform, tag, entries, dir, client = createClient(settings), fetchImpl = fetch }) {
+export async function backupToOss({ settings, platform, entries, dir, client = createClient(settings), fetchImpl = fetch }) {
   const files = [];
   for (const { artifactName, sha256 } of entries) {
     const expectedExtension = platform === 'ios' ? '.ipa' : '.apk';
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(artifactName)
         || !artifactName.endsWith(expectedExtension)
         || !/^[a-f0-9]{64}$/.test(sha256)
-        || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(tag)
-        || !['test', 'production'].includes(releaseEnv)) {
+        || !['ios', 'android'].includes(platform)) {
       throw new Error('OSS 备份产物名称、摘要或发布路径无效');
     }
     const file = path.join(dir, artifactName);
     const size = statSync(file).size;
-    const key = `${settings.prefix}/${releaseEnv}/${platform}/${tag}/${sha256}/${artifactName}`;
+    const key = `${settings.prefix}/appupdate/${artifactName}`;
     await uploadObject(client, key, file, size, sha256);
     files.push(await describeOssObject({ client, key, artifactName, sha256, size, fetchImpl }));
   }

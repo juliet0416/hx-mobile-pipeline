@@ -17,17 +17,17 @@ const SUMMARY = {
   sha256: 'a'.repeat(64),
 };
 
-test('planRelease 生成带平台前缀的稳定 tag', () => {
+test('planRelease 让两种平台和不同构建号按版本共用 Release', () => {
   assert.deepEqual(planRelease({ summaries: [SUMMARY] }), {
     skipped: false,
     platform: 'android',
     version: '1.5.4',
     buildNumber: '29712345',
-    tag: 'android-v1.5.4-29712345',
+    tag: 'mobile-v1.5.4',
   });
   assert.equal(
-    planRelease({ summaries: [{ ...SUMMARY, platform: 'ios', target: 'production' }], tagPrefix: 'release' }).tag,
-    'release-v1.5.4-29712345',
+    planRelease({ summaries: [{ ...SUMMARY, platform: 'ios', buildNumber: '2', target: 'production' }] }).tag,
+    'mobile-v1.5.4',
   );
   assert.equal(planRelease({ summaries: [] }).skipped, true);
   assert.throws(
@@ -43,29 +43,23 @@ test('planRelease 缺目标时不发布', () => {
   assert.equal(planRelease({ summaries: [SUMMARY], expectedTargets: ['cn'] }).skipped, false);
 });
 
-test('buildReleaseNotes 列出目标与临时签名警告', () => {
+test('buildReleaseNotes 只说明共享源码和文件名格式', () => {
   const notes = buildReleaseNotes({
-    platform: 'android',
     sourceRepo: 'example/repo',
-    ref: 'main',
-    releaseEnv: 'production',
-    signingMode: 'temp',
-    summaries: [SUMMARY, { ...SUMMARY, target: 'global', artifactName: 'mobile-app-1.5.4-29712345-global.apk' }],
+    tag: 'example-mobile-v1.5.4',
   });
-  assert.match(notes, /example\/repo@main/);
-  assert.match(notes, /\| cn \|/);
-  assert.match(notes, /\| global \|/);
-  assert.match(notes, /临时签名/);
+  assert.match(notes, /example\/repo\/tree\/example-mobile-v1\.5\.4/);
+  assert.match(notes, /Android APK 和 iOS IPA/);
 });
 
 test('releaseAssets 上传 APK 本体与校验文件，而不是 summary', () => {
-  const present = new Set(['/tmp/x/mobile-app-1.5.4-29712345-cn.apk', '/tmp/x/cn.sha256']);
+  const present = new Set(['/tmp/x/mobile-app-1.5.4-29712345-cn.apk', '/tmp/x/mobile-app-1.5.4-29712345-cn.apk.sha256']);
   const assets = releaseAssets({
     dir: '/tmp/x',
     summary: { target: 'cn', artifactName: 'mobile-app-1.5.4-29712345-cn.apk' },
     exists: (file) => present.has(file),
   });
-  assert.deepEqual(assets, ['/tmp/x/mobile-app-1.5.4-29712345-cn.apk', '/tmp/x/cn.sha256']);
+  assert.deepEqual(assets, ['/tmp/x/mobile-app-1.5.4-29712345-cn.apk', '/tmp/x/mobile-app-1.5.4-29712345-cn.apk.sha256']);
   assert.equal(
     releaseAssets({
       dir: '/tmp/x',
@@ -90,9 +84,10 @@ test('publish-release only sends signed artifacts to the private source and pins
       'printf "%s\\n" "$*" >> "$GH_CALLS"',
       'case "$1:$2" in',
       '  api:repos/example/source) printf "%s\\n" "$SOURCE_PRIVATE";;',
-      '  api:repos/example/source/commits/*) printf "%s\\n" "$TEST_COMMIT";;',
+      '  api:repos/example/source/git/matching-refs/tags/*) printf \'%s\\n\' \'[{"ref":"refs/tags/example-release-mobile-v1.5.4"}]\';;',
+      '  api:repos/example/source/commits/*) printf "%s\\n" "${REMOTE_COMMIT:-$TEST_COMMIT}";;',
       '  release:view) if [ "${RELEASE_EXISTS:-false}" = true ]; then',
-      '    printf \'%s\\n\' \'{"assets":[{"name":"oss-download.json"}]}\'',
+      '    printf "%s\\n" "$PREVIOUS_RELEASE"',
       '    else exit 1; fi;;',
       'esac',
     ].join('\n') + '\n', { mode: 0o700 });
@@ -120,18 +115,30 @@ test('publish-release only sends signed artifacts to the private source and pins
     const published = spawnSync(process.execPath, [cli], { env: { ...env, SOURCE_PRIVATE: 'true' }, encoding: 'utf8' });
     assert.equal(published.status, 0, published.stderr);
     const calls = readFileSync(log, 'utf8');
-    assert.match(calls, new RegExp(`release create example-release-test-android-v1\\.5\\.4-29712345 --repo example/source --target ${hash} --latest=false --prerelease`));
+    assert.match(calls, new RegExp(`release create example-release-mobile-v1\\.5\\.4 --repo example/source --target ${hash} --latest=false --prerelease`));
     assert.match(calls, /release upload .* --repo example\/source --clobber/);
     assert.doesNotMatch(calls, /example\/public-pipeline/);
 
     const retried = spawnSync(process.execPath, [cli], {
-      env: { ...env, SOURCE_PRIVATE: 'true', RELEASE_EXISTS: 'true' },
+      env: {
+        ...env, SOURCE_PRIVATE: 'true', RELEASE_EXISTS: 'true',
+        PREVIOUS_RELEASE: JSON.stringify({
+          assets: [{ name: 'app-prod.ipa.oss.json', state: 'uploaded' }], isPrerelease: true,
+        }),
+      },
       encoding: 'utf8',
     });
     assert.equal(retried.status, 0, retried.stderr);
     const retryCalls = readFileSync(log, 'utf8').slice(calls.length);
-    assert.match(retryCalls, /release delete-asset .* oss-download\.json[^\n]*\nrelease upload /);
-    assert.match(retryCalls, /release edit .* --notes/);
+    assert.match(retryCalls, /release upload example-release-mobile-v1\.5\.4/);
+    assert.doesNotMatch(retryCalls, /release (delete-asset|edit|create)/);
+
+    const wrongCommit = spawnSync(process.execPath, [cli], {
+      env: { ...env, SOURCE_PRIVATE: 'true', REMOTE_COMMIT: 'b'.repeat(40) },
+      encoding: 'utf8',
+    });
+    assert.equal(wrongCommit.status, 1);
+    assert.match(wrongCommit.stderr, /不同源码提交/);
   } finally {
     rmSync(temp, { force: true, recursive: true });
   }

@@ -59,6 +59,7 @@ function main() {
     buildNumber,
     target,
     extension: platform === 'android' ? 'apk' : 'ipa',
+    releaseEnv: process.env.EXPO_PUBLIC_RELEASE_ENV,
   });
 
   writeEnv({

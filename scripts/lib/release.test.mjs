@@ -54,11 +54,15 @@ test('resolveBuildNumber 优先显式值，否则按分钟递增', () => {
 test('buildArtifactName 生成 apk / ipa 文件名', () => {
   assert.equal(
     buildArtifactName({ version: '1.5.4', buildNumber: '29712345', target: 'cn', extension: 'apk' }),
-    'mobile-app-1.5.4-29712345-cn.apk',
+    'mobile-app_Android_1.5.4-29712345_prod.apk',
   );
   assert.equal(
     buildArtifactName({ prefix: 'demo', version: '1.5.4', buildNumber: '2', target: 'production', extension: 'ipa' }),
-    'demo-1.5.4-2-production.ipa',
+    'demo_iOS_1.5.4-2_prod.ipa',
+  );
+  assert.equal(
+    buildArtifactName({ prefix: 'demo', version: '1.5.4', buildNumber: '2', target: 'production', extension: 'apk', releaseEnv: 'test' }),
+    'demo_Android_global_1.5.4-2_test.apk',
   );
   assert.throws(
     () => buildArtifactName({ version: '1.5', buildNumber: '2', target: 'cn', extension: 'apk' }),
@@ -99,17 +103,17 @@ test('patchGradleVersion 在字段缺失或重复时失败', () => {
   assert.throws(() => patchGradleVersion('versionCode 1\nversionName "1.0"', { version: '1.5.4', buildNumber: '0' }), /正整数/);
 });
 
-test('buildReleaseTag 区分平台，避免 Android/iOS 抢同一个 tag', () => {
+test('buildReleaseTag 每个品牌的同一版本共用一个标记', () => {
   assert.equal(
-    buildReleaseTag({ platform: 'android', version: '1.5.4', buildNumber: '100' }),
-    'android-v1.5.4-100',
+    buildReleaseTag({ version: '1.5.4' }),
+    'mobile-v1.5.4',
   );
   assert.equal(
-    buildReleaseTag({ platform: 'ios', version: '1.5.4', buildNumber: '100' }),
-    'ios-v1.5.4-100',
+    buildReleaseTag({ version: '1.5.4', prefix: 'example' }),
+    'example-mobile-v1.5.4',
   );
-  assert.equal(
-    buildReleaseTag({ platform: 'android', version: '1.5.4', buildNumber: '100', prefix: 'apk' }),
-    'apk-v1.5.4-100',
+  assert.throws(
+    () => buildReleaseTag({ version: '1.5.5', prefix: 'example', ref: 'refs/tags/example-mobile-v1.5.4' }),
+    /版本与所选源码 tag 不一致/,
   );
 });

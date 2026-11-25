@@ -9,7 +9,7 @@ import { createHmac } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildReleaseTag, privateReleasePrefix } from './lib/release.mjs';
+import { buildReleaseTag } from './lib/release.mjs';
 
 const SUCCESS_RESULTS = new Set(['success', 'skipped']);
 const PLATFORM_LABEL = { android: 'Android', ios: 'iOS' };
@@ -32,7 +32,7 @@ export function resolveOverallStatus(jobResults) {
 export function readReleaseSummaries(dir) {
   if (!dir || !existsSync(dir)) return [];
   return readdirSync(dir)
-    .filter((file) => file.endsWith('.json'))
+    .filter((file) => file.endsWith('.json') && !file.endsWith('.oss.json'))
     .sort()
     .map((file) => JSON.parse(readFileSync(path.join(dir, file), 'utf8')));
 }
@@ -212,10 +212,9 @@ async function main() {
   const repo = process.env.RELEASE_SOURCE_REPO;
   const releaseEnv = process.env.RELEASE_RELEASE_ENV;
   const tag = uploaded ? buildReleaseTag({
-    prefix: privateReleasePrefix({ tagPrefix: process.env.RELEASE_TAG_PREFIX, releaseEnv, platform }),
-    platform,
+    prefix: process.env.RELEASE_TAG_PREFIX,
+    ref: process.env.RELEASE_REF,
     version,
-    buildNumber,
   }) : '';
 
   const payload = buildCard({

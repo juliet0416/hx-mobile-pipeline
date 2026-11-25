@@ -51,10 +51,6 @@ export function resolveRegion(target) {
   return trim(target) === 'cn' ? 'cn' : '';
 }
 
-export function privateReleasePrefix({ tagPrefix, releaseEnv, platform }) {
-  return [trim(tagPrefix), trim(releaseEnv) || 'production', trim(platform)].filter(Boolean).join('-');
-}
-
 export function parseSemver(raw, label = 'version') {
   const value = trim(raw);
   if (!SEMVER.test(value)) {
@@ -99,15 +95,20 @@ export function resolveBuildNumber({ explicit, offset = 0, now = Date.now() } = 
   return String(value);
 }
 
-export function buildArtifactName({ prefix = 'mobile-app', version, buildNumber, target, extension }) {
+export function buildArtifactName({ prefix = 'mobile-app', version, buildNumber, target, extension, releaseEnv }) {
   const safePrefix = trim(prefix) || 'mobile-app';
-  if (!ANDROID_TARGETS.includes(trim(target)) && trim(target) !== 'production') {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(safePrefix)) fail('产物前缀无效');
+  const releaseTarget = trim(target);
+  const fileType = trim(extension);
+  if (!ANDROID_TARGETS.includes(releaseTarget)) {
     fail(`未知 target "${target}"`);
   }
-  if (!['apk', 'ipa'].includes(trim(extension))) {
+  if (!['apk', 'ipa'].includes(fileType)) {
     fail(`未知产物类型 "${extension}"`);
   }
-  return `${safePrefix}-${parseSemver(version)}-${parseBuildNumber(buildNumber)}-${trim(target)}.${trim(extension)}`;
+  const kind = fileType === 'ipa' ? 'iOS' : releaseTarget === 'cn' ? 'Android' : 'Android_global';
+  const env = parseReleaseEnv(releaseEnv) === 'test' ? 'test' : 'prod';
+  return `${safePrefix}_${kind}_${parseSemver(version)}-${parseBuildNumber(buildNumber)}_${env}.${fileType}`;
 }
 
 /**
@@ -152,9 +153,15 @@ export function patchGradleVersion(text, { version, buildNumber }) {
   return patched;
 }
 
-/** 发布 tag：平台前缀 + 版本 + 构建号，避免 Android/iOS 互相覆盖。 */
-export function buildReleaseTag({ platform, version, buildNumber, prefix = '' }) {
-  const safePrefix = trim(prefix) || trim(platform);
-  if (!safePrefix) fail('release tag 前缀不能为空');
-  return `${safePrefix}-v${parseSemver(version)}-${parseBuildNumber(buildNumber)}`;
+/** 各平台和环境的产物按品牌源码版本聚合。 */
+export function buildReleaseTag({ version, prefix = '', ref = '' }) {
+  const brand = trim(prefix);
+  if (brand && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(brand)) fail('release tag 前缀无效');
+  const tagPrefix = `${brand ? `${brand}-` : ''}mobile-v`;
+  const tag = `${tagPrefix}${parseSemver(version)}`;
+  const source = trim(ref).replace(/^refs\/tags\//, '');
+  if (source.startsWith(tagPrefix) && SEMVER.test(source.slice(tagPrefix.length)) && source !== tag) {
+    fail('构建版本与所选源码 tag 不一致');
+  }
+  return tag;
 }

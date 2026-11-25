@@ -7,8 +7,8 @@
 | Android | APK（`cn`、`global` 或 `production`） | `mobile-android-release` | 直装 |
 | iOS | IPA | `mobile-ios-release` | 可选 TestFlight |
 
-一次运行构建一个目标。构建 job 从运行器直接把签名包上传至源码私库的 GitHub Release。Android 使用独立运行器的 Gradle 缓存，关闭公开仓库的跨运行缓存。
-配置 OSS 后，同一签名包还会备份到私有 OSS 前缀。私库 Release 附带 `oss-download.json`，记录对象路径、校验值和通过验证的 7 天签名链接。默认域名拒绝 APK 或 IPA 下载时，通过已绑定的 OSS 自定义 HTTPS 域名启用下载链接。
+一次运行构建一个目标。构建 job 从运行器直接把签名包上传至源码私库。同一品牌版本的各平台和环境共用一条 GitHub Release。Android 使用独立运行器的 Gradle 缓存，关闭公开仓库的跨运行缓存。
+配置 OSS 后，同一签名包还会备份到私有 OSS 前缀。每个安装包附带自己的 `.sha256` 和 `.oss.json`，记录对象路径、校验值和通过验证的 7 天签名链接。默认域名拒绝 APK 或 IPA 下载时，通过已绑定的 OSS 自定义 HTTPS 域名启用下载链接。
 配置飞书机器人后会发送打包结果卡片。失败或取消时，独立通知工作流会检查原运行，并在通知步骤未成功时补发。
 
 ## 目录
@@ -38,7 +38,7 @@ gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 
 - `version` 留空时读取源码 `apps/mobile/app.config.ts`
 - `build_number` 留空时，iOS 查询 App Store Connect；Android 使用 `ANDROID_VERSION_CODE_BASE`、运行号和偏移值
-- Release tag 按环境和平台生成，并指向实际 checkout 的源码提交
+- Release 复用 `<品牌>-mobile-v<版本>` 源码 tag，并校验 tag 指向实际 checkout 的提交。测试包可以先发到预发布，同版本正式包发布后会转正。
 
 ### 后端地址（Android）
 
@@ -82,7 +82,7 @@ gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 | `OTA_TARGET_GLOBAL` / `OTA_TARGET_CN` | variable | 源码 App 的 OTA target 名称 |
 | `EXPO_TOKEN` | secret | EAS 发布令牌 |
 
-Android 需要完整的正式签名材料。启用 OSS 后，备份对象保持私有，地址按环境、平台、Release tag 和文件摘要区分。签名链接只写入私库的下载清单。
+Android 需要完整的正式签名材料。启用 OSS 后，备份对象保持私有。文件平铺到 `<RELEASE_OSS_PREFIX>/appupdate/`，以平台、版本、构建号及 `_test` / `_prod` 文件名区分。签名链接只写入私库的下载清单。
 64 MiB 或以上的文件使用分片上传。RAM 凭据具有 `oss:AbortMultipartUpload` 权限时，可自动清理失败的分片任务。
 
 ## 本地校验

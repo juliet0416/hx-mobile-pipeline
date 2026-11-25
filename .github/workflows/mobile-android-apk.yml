@@ -268,7 +268,7 @@ jobs:
           cp "$chosen" "$destination"
           digest=$(sha256sum "$destination" | awk '{print $1}')
           size=$(stat -c %s "$destination")
-          printf '%s  %s\n' "$digest" "$ARTIFACT_NAME" > ".private/artifacts/${BUILD_TARGET}.sha256"
+          printf '%s  %s\n' "$digest" "$ARTIFACT_NAME" > ".private/artifacts/${ARTIFACT_NAME}.sha256"
 
           TARGET="$BUILD_TARGET" VERSION="$BUILD_VERSION" BUILD_NUMBER="$BUILD_NUMBER" \
           ARTIFACT_NAME="$ARTIFACT_NAME" SHA256="$digest" SIZE="$size" \
