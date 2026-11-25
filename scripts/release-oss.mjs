@@ -3,6 +3,8 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 export const OSS_DOWNLOAD_MANIFEST = 'oss-download.json';
+const MULTIPART_THRESHOLD = 64 * 1024 * 1024;
+const MULTIPART_PART_SIZE = 8 * 1024 * 1024;
 
 //#region OSS 私有备份
 
@@ -38,9 +40,45 @@ function createClient({ bucket, region, endpoint, accessKeyId, accessKeySecret }
   const OSS = requireFromSource('ali-oss');
   return new OSS({
     bucket, region: `oss-${region}`, accessKeyId, accessKeySecret,
-    authorizationV4: true, secure: true, timeout: 600_000,
+    authorizationV4: true, secure: true, timeout: 120_000, retryMax: 2,
     ...(endpoint ? { endpoint, cname: true } : {}),
   });
+}
+
+function uploadErrorLabel(error) {
+  return [error?.code, error?.name, error?.status].find((value) =>
+    /^[a-z0-9_-]+$/i.test(String(value ?? '')) && value !== 'Error') ?? '未知错误';
+}
+
+async function uploadObject(client, key, file, size, sha256) {
+  const options = {
+    headers: { 'x-oss-object-acl': 'private', 'x-oss-forbid-overwrite': 'true' },
+    meta: { sha256 },
+  };
+  let uploadId;
+  try {
+    if (size >= MULTIPART_THRESHOLD) {
+      await client.multipartUpload(key, file, {
+        ...options,
+        partSize: MULTIPART_PART_SIZE,
+        parallel: 3,
+        progress(_progress, checkpoint) { uploadId = checkpoint?.uploadId; },
+      });
+    } else {
+      await client.put(key, file, options);
+    }
+  } catch (error) {
+    if (uploadId) {
+      try {
+        await client.abortMultipartUpload(key, uploadId);
+      } catch (cleanupError) {
+        console.warn(`[oss] 清理分片上传失败（${uploadErrorLabel(cleanupError)}）`);
+      }
+    }
+    if (error?.code !== 'FileAlreadyExists' && error?.status !== 409) {
+      throw new Error(`OSS ${size >= MULTIPART_THRESHOLD ? '分片上传' : '上传'}失败（${uploadErrorLabel(error)}）`);
+    }
+  }
 }
 
 export async function backupToOss({ settings, releaseEnv, platform, tag, entries, dir, client = createClient(settings) }) {
@@ -59,20 +97,11 @@ export async function backupToOss({ settings, releaseEnv, platform, tag, entries
     const file = path.join(dir, artifactName);
     const size = statSync(file).size;
     const key = `${settings.prefix}/${releaseEnv}/${platform}/${tag}/${sha256}/${artifactName}`;
-    try {
-      await client.put(key, file, {
-        headers: { 'x-oss-object-acl': 'private', 'x-oss-forbid-overwrite': 'true' },
-        meta: { sha256 },
-      });
-    } catch (error) {
-      // 同一份产物的重试复用已校验的对象。
-      if (error?.code !== 'FileAlreadyExists' && error?.status !== 409) {
-        throw new Error(`OSS 上传失败（${error?.code || error?.status || '未知错误'}）`);
-      }
-      const existing = await client.head(key);
-      if (existing.meta?.sha256 !== sha256 || Number(existing.res?.headers?.['content-length']) !== size) {
-        throw new Error('已存在的 OSS 对象与待备份产物不一致');
-      }
+    await uploadObject(client, key, file, size, sha256);
+    // 成功上传与同名重试都校验对象，再签发下载链接。
+    const stored = await client.head(key);
+    if (stored.meta?.sha256 !== sha256 || Number(stored.res?.headers?.['content-length']) !== size) {
+      throw new Error('OSS 对象与待备份产物不一致');
     }
     const url = await client.signatureUrlV4('GET', expiresSeconds, undefined, key);
     files.push({ fileName: artifactName, key, sha256, sizeBytes: size, expiresAt, url });

@@ -83,6 +83,7 @@ gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 | `EXPO_TOKEN` | secret | EAS 发布令牌 |
 
 Android 需要完整的正式签名材料。启用 OSS 后，备份对象保持私有，地址按环境、平台、Release tag 和文件摘要区分。签名链接只写入私库的下载清单。
+64 MiB 或以上的文件使用分片上传。RAM 凭据具有 `oss:AbortMultipartUpload` 权限时，可自动清理失败的分片任务。
 
 ## 本地校验
 
