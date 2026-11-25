@@ -99,13 +99,13 @@ test('publish-release only sends signed artifacts to the private source and pins
     writeFileSync(path.join(temp, 'git'), '#!/bin/sh\nprintf "%s\\n" "$TEST_COMMIT"\n', { mode: 0o700 });
     const cli = fileURLToPath(new URL('./publish-release.mjs', import.meta.url));
     const env = {
-      ...process.env,
       PATH: temp + ':' + process.env.PATH,
       GH_CALLS: log,
       GH_TOKEN: 'test-token',
       GITHUB_REPOSITORY: 'example/public-pipeline',
       RELEASE_SUMMARIES_DIR: dir,
       RELEASE_SOURCE_REPO: 'example/source',
+      RELEASE_TAG_PREFIX: 'example-release',
       RELEASE_RELEASE_ENV: 'test',
       RELEASE_EXPECTED_TARGETS: 'cn',
       RELEASE_OSS_ENABLED: 'false',
@@ -120,7 +120,7 @@ test('publish-release only sends signed artifacts to the private source and pins
     const published = spawnSync(process.execPath, [cli], { env: { ...env, SOURCE_PRIVATE: 'true' }, encoding: 'utf8' });
     assert.equal(published.status, 0, published.stderr);
     const calls = readFileSync(log, 'utf8');
-    assert.match(calls, new RegExp(`release create test-android-v1\\.5\\.4-29712345 --repo example/source --target ${hash} --latest=false --prerelease`));
+    assert.match(calls, new RegExp(`release create example-release-test-android-v1\\.5\\.4-29712345 --repo example/source --target ${hash} --latest=false --prerelease`));
     assert.match(calls, /release upload .* --repo example\/source --clobber/);
     assert.doesNotMatch(calls, /example\/public-pipeline/);
 
