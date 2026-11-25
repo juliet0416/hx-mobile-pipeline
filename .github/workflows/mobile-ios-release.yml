@@ -1,6 +1,9 @@
 name: Mobile iOS Release
 
-run-name: iOS IPA ${{ github.event.client_payload.ref || inputs.ref }}
+run-name: >-
+  iOS IPA ${{ github.event.client_payload.ref || inputs.ref }} ·
+  ${{ github.event.client_payload.release_env || inputs.release_env || 'test' }} · production ·
+  ${{ (toJSON(github.event.client_payload.submit) == 'true' || inputs.submit == true) && 'TestFlight' || 'IPA' }}
 
 on:
   workflow_dispatch:
@@ -320,9 +323,9 @@ jobs:
           RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
           RELEASE_VERSION: ${{ needs.build.outputs.version || needs.prepare.outputs.version || env.MOBILE_VERSION }}
           RELEASE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number || env.MOBILE_BUILD_NUMBER }}
-          RELEASE_TARGETS: ${{ needs.prepare.outputs.target }}
-          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
+          RELEASE_TARGETS: ${{ needs.prepare.outputs.target || env.MOBILE_TARGET }}
+          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env || env.MOBILE_RELEASE_ENV }}
+          RELEASE_SUBMIT_TO_STORE: ${{ env.SUBMIT_TO_STORE }}
           RELEASE_UPLOADED: ${{ needs.build.outputs.uploaded }}
-          RELEASE_PIPELINE_REPO: ${{ github.repository }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node scripts/notify-feishu-release.mjs

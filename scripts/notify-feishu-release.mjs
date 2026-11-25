@@ -12,7 +12,12 @@ import { fileURLToPath } from 'node:url';
 import { buildReleaseTag, privateReleasePrefix } from './lib/release.mjs';
 
 const SUCCESS_RESULTS = new Set(['success', 'skipped']);
-const PLATFORM_LABEL = { android: 'Android APK', ios: 'iOS IPA' };
+const PLATFORM_LABEL = { android: 'Android', ios: 'iOS' };
+const WORKFLOW_PLATFORM = {
+  '.github/workflows/mobile-android-apk.yml': 'android',
+  '.github/workflows/mobile-ios-release.yml': 'ios',
+};
+const ENVIRONMENT_LABEL = { test: '测试环境', production: '正式环境' };
 const STATUS_TEXT = { success: '成功', cancelled: '已取消', failure: '失败' };
 const STATUS_TEMPLATE = { success: 'green', cancelled: 'grey', failure: 'red' };
 
@@ -42,8 +47,12 @@ export function buildSignedBody(payload, options = {}) {
 function field(label, value) {
   return {
     is_short: true,
-    text: { tag: 'lark_md', content: `**${label}**\n${value}` },
+    text: { tag: 'lark_md', content: `**${label}**\n${value || '—'}` },
   };
+}
+
+function link(label, url) {
+  return url ? `[${label}](${url})` : label;
 }
 
 function assetUrl({ repo, tag, fileName }) {
@@ -51,50 +60,46 @@ function assetUrl({ repo, tag, fileName }) {
   return `https://github.com/${repo}/releases/download/${tag}/${encodeURIComponent(fileName)}`;
 }
 
-function formatBytes(bytes) {
-  const value = Number(bytes);
-  if (!Number.isFinite(value) || value <= 0) return '';
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
-
 export function buildCard(input) {
   const platform = input.platform ?? 'android';
   const label = PLATFORM_LABEL[platform] ?? platform;
   const status = input.status ?? 'failure';
-  const targets = input.targets?.length ? input.targets.join(', ') : '—';
-  const version = input.version ? `v${input.version}` : '—';
-
-  const elements = [
-    {
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: `**${label}**${input.releaseEnv ? ` · release_env \`${input.releaseEnv}\`` : ''}`,
-      },
-    },
-    {
-      tag: 'div',
-      fields: [
-        field('源码', `${input.sourceRepo ?? '—'}\n\`${input.ref ?? '—'}\``),
-        field('目标', targets),
-        field('版本', `${version}\nbuild \`${input.buildNumber ?? '—'}\``),
-      ],
-    },
+  const environment = ENVIRONMENT_LABEL[input.releaseEnv];
+  const version = input.version ? `v${input.version}` : '';
+  const sourceUrl = input.sourceRepo && input.ref
+    ? `https://github.com/${input.sourceRepo}/tree/${encodeURIComponent(input.ref)}`
+    : '';
+  const fields = [
+    field('平台', label),
+    field('数据环境', environment),
+    field('源码 ref', link(input.ref, sourceUrl)),
+    field('版本', version),
+    field('构建号', input.buildNumber),
+    field('发布目标', input.targets?.join(', ')),
   ];
-
-  const summaries = input.summaries ?? [];
-  if (summaries.length > 0) {
-    const lines = summaries.map((summary) => {
-      const url = input.uploaded
-        ? (summary.downloadUrl ?? assetUrl({ repo: input.repo, tag: input.tag, fileName: summary.artifactName }))
-        : '';
-      const meta = [summary.artifactName, summary.sizeBytes ? formatBytes(summary.sizeBytes) : '']
-        .filter(Boolean)
-        .join(' · ');
-      return url ? `- [${summary.target}](${url}) · ${meta}` : `- ${summary.target} · ${meta}（未生成下载链接）`;
-    });
-    elements.push({ tag: 'hr' }, { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } });
+  if (platform === 'ios' && typeof input.submitToStore === 'boolean') {
+    fields.push(field('提交 TestFlight', input.submitToStore ? '是' : '否'));
   }
+  if (status === 'failure' && input.failureStage) fields.push(field('失败阶段', input.failureStage));
+
+  const artifacts = (input.summaries ?? []).filter((item) => item.artifactName).map((item) => {
+    const url = input.uploaded && (item.downloadUrl || assetUrl({ repo: input.repo, tag: input.tag, fileName: item.artifactName }));
+    return link(item.artifactName, url);
+  });
+  if (artifacts.length > 0) {
+    fields.push(field('产物', artifacts.join('\n')));
+  } else if (input.releaseUrl) {
+    fields.push(field('产物', link('查看私库 Release', input.releaseUrl)));
+  }
+  if (input.runUrl) fields.push(field('Actions', link(input.runNumber ? `#${input.runNumber}` : '查看运行', input.runUrl)));
+
+  const summary = [input.ref, environment, version, input.buildNumber && `构建 ${input.buildNumber}`]
+    .filter(Boolean).join(' · ');
+  const elements = summary ? [
+    { tag: 'div', text: { tag: 'lark_md', content: summary } },
+    { tag: 'hr' },
+  ] : [];
+  elements.push({ tag: 'div', fields });
 
   if (input.signingMode === 'temp') {
     elements.push({
@@ -103,25 +108,13 @@ export function buildCard(input) {
     });
   }
 
-  if (input.releaseUrl) {
-    elements.push({
-      tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: `[发布页](${input.releaseUrl})${input.runUrl ? ` · [流水线](${input.runUrl})` : ''}`,
-      },
-    });
-  } else if (input.runUrl) {
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: `[流水线](${input.runUrl})` } });
-  }
-
   return {
     msg_type: 'interactive',
     card: {
       config: { wide_screen_mode: true },
       header: {
         template: STATUS_TEMPLATE[status] ?? 'red',
-        title: { tag: 'plain_text', content: `${label} 构建${STATUS_TEXT[status] ?? '未知'}` },
+        title: { tag: 'plain_text', content: `${label} 打包${STATUS_TEXT[status] ?? '未知'}` },
       },
       elements,
     },
@@ -134,6 +127,7 @@ export async function sendFeishuNotification({ fetchImpl = fetch, payload, secre
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
   });
   const text = await response.text().catch(() => '');
   let parsed = null;
@@ -143,15 +137,69 @@ export async function sendFeishuNotification({ fetchImpl = fetch, payload, secre
     parsed = null;
   }
   const code = parsed?.code ?? parsed?.StatusCode;
-  const ok = response.ok && (code === undefined || code === 0);
-  if (!ok) warn(`[feishu] webhook returned ${response.status}: ${text}`);
+  const ok = response.ok && code === 0;
+  if (!ok) warn(`[feishu] webhook returned HTTP ${response.status}, code=${code ?? 'missing'}`);
   return { ok, status: response.status, text };
 }
+
+//#region 独立的失败和取消通知
+
+export function buildFallbackInput(run, jobs, sourceRepo) {
+  const platform = WORKFLOW_PLATFORM[run.path];
+  if (!platform || jobs.some((job) => job.name === 'notify' && job.steps?.some((step) =>
+    step.name === 'Notify Feishu release bot' && step.conclusion === 'success'))) return null;
+
+  const [title, releaseEnv, target, store] = (run.display_title ?? '').split(' · ');
+  const ref = /^(?:Android APK|iOS IPA) ([A-Za-z0-9][A-Za-z0-9._/-]*)$/.exec(title)?.[1];
+  const failedJob = jobs.find((job) => job.name !== 'notify' && job.conclusion === 'failure');
+  const failedStep = failedJob?.steps?.find((step) => step.conclusion === 'failure');
+  const build = jobs.find((job) => job.name === 'build');
+  const status = build?.conclusion === 'success' && !failedJob && run.conclusion !== 'cancelled'
+    ? 'success'
+    : resolveOverallStatus([run.conclusion, ...jobs.filter((job) => job.name !== 'notify').map((job) => job.conclusion)]);
+  return {
+    platform, status, sourceRepo, ref, releaseEnv,
+    targets: target ? [target] : [],
+    version: /-v(\d+\.\d+\.\d+)$/.exec(ref)?.[1],
+    submitToStore: platform === 'ios' && store ? store === 'TestFlight' : undefined,
+    failureStage: failedStep?.name || failedJob?.name,
+    runNumber: run.run_number,
+    runUrl: run.html_url,
+  };
+}
+
+async function loadFallbackInput(env) {
+  const run = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8')).workflow_run;
+  if (!run || !WORKFLOW_PLATFORM[run.path]) return null;
+  const url = `${env.GITHUB_API_URL}/repos/${env.GITHUB_REPOSITORY}/actions/runs/${run.id}/attempts/${run.run_attempt}/jobs?per_page=100`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${env.GH_TOKEN}`,
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`Failed to read Actions jobs (HTTP ${response.status})`);
+  return buildFallbackInput(run, (await response.json()).jobs, env.RELEASE_SOURCE_REPO);
+}
+
+//#endregion
 
 async function main() {
   const webhookUrl = process.env.FEISHU_RELEASE_WEBHOOK_URL?.trim();
   if (!webhookUrl) {
     console.log('[feishu] skipped: FEISHU_RELEASE_WEBHOOK_URL is not configured');
+    return;
+  }
+  const secret = process.env.FEISHU_RELEASE_WEBHOOK_SECRET;
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_run') {
+    const fallback = await loadFallbackInput(process.env);
+    if (!fallback) {
+      console.log('[feishu] no fallback notification needed');
+      return;
+    }
+    const result = await sendFeishuNotification({ payload: buildCard(fallback), secret, webhookUrl });
+    if (!result.ok) throw new Error('Feishu fallback notification failed');
     return;
   }
 
@@ -178,6 +226,7 @@ async function main() {
     releaseEnv,
     releaseUrl: tag && repo ? `https://github.com/${repo}/releases/tag/${tag}` : '',
     repo,
+    runNumber: process.env.GITHUB_RUN_NUMBER,
     runUrl: process.env.RELEASE_RUN_URL,
     signingMode: process.env.RELEASE_SIGNING_MODE,
     sourceRepo: process.env.RELEASE_SOURCE_REPO,
@@ -185,14 +234,17 @@ async function main() {
     summaries,
     tag,
     targets: (process.env.RELEASE_TARGETS ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+    submitToStore: process.env.RELEASE_SUBMIT_TO_STORE === undefined ? undefined : process.env.RELEASE_SUBMIT_TO_STORE === 'true',
+    failureStage: process.env.PREPARE_RESULT === 'failure' ? '准备发布' : '构建或上传',
     version,
   });
 
   const result = await sendFeishuNotification({
     payload,
-    secret: process.env.FEISHU_RELEASE_WEBHOOK_SECRET,
+    secret,
     webhookUrl,
   });
+  if (!result.ok) throw new Error('Feishu notification failed');
   console.log(`[feishu] status=${result.status}`);
 }
 

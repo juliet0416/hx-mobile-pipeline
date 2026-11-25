@@ -1,0 +1,35 @@
+name: Mobile Release Notification
+
+on:
+  workflow_run:
+    workflows: [Android APK Release, Mobile iOS Release]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  notify:
+    # 构建未能执行自身通知时，由独立工作流补发。
+    if: >-
+      ${{ github.event.workflow_run.head_repository.full_name == github.repository &&
+          (github.event.workflow_run.conclusion == 'cancelled' ||
+           github.event.workflow_run.conclusion == 'failure' ||
+           github.event.workflow_run.conclusion == 'timed_out' ||
+           github.event.workflow_run.conclusion == 'startup_failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Notify Feishu release bot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FEISHU_RELEASE_WEBHOOK_URL: ${{ secrets.FEISHU_RELEASE_WEBHOOK_URL || vars.FEISHU_RELEASE_WEBHOOK_URL }}
+          FEISHU_RELEASE_WEBHOOK_SECRET: ${{ secrets.FEISHU_RELEASE_WEBHOOK_SECRET || vars.FEISHU_RELEASE_WEBHOOK_SECRET }}
+          RELEASE_SOURCE_REPO: ${{ secrets.RELEASE_SOURCE_REPO }}
+        run: node scripts/notify-feishu-release.mjs

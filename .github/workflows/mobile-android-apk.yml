@@ -1,6 +1,9 @@
 name: Android APK Release
 
-run-name: Android APK ${{ github.event.client_payload.ref || inputs.ref }} · ${{ github.event.client_payload.target || inputs.target }}
+run-name: >-
+  Android APK ${{ github.event.client_payload.ref || inputs.ref }} ·
+  ${{ github.event.client_payload.release_env || inputs.release_env || 'test' }} ·
+  ${{ github.event.client_payload.target || inputs.target || 'global' }}
 
 on:
   workflow_dispatch:
@@ -342,6 +345,5 @@ jobs:
           RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env || env.MOBILE_RELEASE_ENV }}
           RELEASE_SIGNING_MODE: provided
           RELEASE_UPLOADED: ${{ needs.build.outputs.uploaded }}
-          RELEASE_PIPELINE_REPO: ${{ github.repository }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node scripts/notify-feishu-release.mjs
