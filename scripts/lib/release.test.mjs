@@ -22,16 +22,16 @@ test('parsePlatform / parseTarget 限制平台与目标组合', () => {
 
   assert.equal(parseTarget('cn', 'android'), 'cn');
   assert.equal(parseTarget('global', 'android'), 'global');
+  assert.equal(parseTarget('production', 'android'), 'production');
   assert.throws(() => parseTarget('both', 'android'), /target/);
   assert.equal(parseTarget('production', 'ios'), 'production');
   assert.throws(() => parseTarget('cn', 'ios'), /target/);
 });
 
-test('parseReleaseEnv 限制 iOS 只能 production', () => {
-  assert.equal(parseReleaseEnv('', 'android'), 'production');
-  assert.equal(parseReleaseEnv('test', 'android'), 'test');
-  assert.throws(() => parseReleaseEnv('test', 'ios'), /production/);
-  assert.throws(() => parseReleaseEnv('staging', 'android'), /release_env/);
+test('parseReleaseEnv accepts test and production service environments', () => {
+  assert.equal(parseReleaseEnv(''), 'production');
+  assert.equal(parseReleaseEnv('test'), 'test');
+  assert.throws(() => parseReleaseEnv('staging'), /release_env/);
 });
 
 test('resolveRegion 仅为 cn 设置区域', () => {

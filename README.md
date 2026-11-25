@@ -4,11 +4,11 @@
 
 | 平台 | 产物 | 触发 | 商店上传 |
 | --- | --- | --- | --- |
-| Android | APK（`cn` / `global` 二选一） | `android-apk-release` | 无（不接 Google Play） |
-| iOS | IPA | `ios-release` | 可选 TestFlight |
+| Android | APK（`cn`、`global` 或 `production`） | `mobile-android-release` | 直装 |
+| iOS | IPA | `mobile-ios-release` | 可选 TestFlight |
 
-一次运行只构建一个目标；产物默认发布到本仓库的 GitHub Release，并保留 Actions Artifact。
-EAS OTA 发布使用 `mobile-ota-update.yml`（配置见下）。
+一次运行构建一个目标。构建 job 从运行器直接把签名包上传至源码私库的 GitHub Release。Android 使用独立运行器的 Gradle 缓存，关闭公开仓库的跨运行缓存。
+配置 OSS 后，同一签名包还会备份到私有 OSS 前缀。私库 Release 附带 `oss-download.json`，记录国内下载所用的 7 天签名链接和校验值。
 
 ## 目录
 
@@ -31,13 +31,13 @@ gh workflow run mobile-android-apk.yml \
 gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 ```
 
-也可通过 `repository_dispatch` 触发（事件名同上），payload 字段与 workflow 输入同名。
+也可通过 `repository_dispatch` 触发，旧事件名 `android-apk-release` 与 `ios-release` 仍可识别。派发参数 `upload_private_release` 对应手动运行的 `upload_release`。
 
 ### 版本与构建号
 
 - `version` 留空时读取源码 `apps/mobile/app.config.ts`
-- `build_number` 留空时按 epoch 分钟单调生成；同一分钟重复构建需显式传值或 offset
-- iOS 与 Android 的 release tag 带平台前缀（`android-v…` / `ios-v…`），互不覆盖
+- `build_number` 留空时，iOS 查询 App Store Connect；Android 使用 `ANDROID_VERSION_CODE_BASE`、运行号和偏移值
+- Release tag 按环境和平台生成，并指向实际 checkout 的源码提交
 
 ### 后端地址（Android）
 
@@ -53,18 +53,26 @@ gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 
 | 名称 | 类型 | 用途 |
 | --- | --- | --- |
-| `SOURCE_REPO` | variable/secret | 源码仓库 `owner/repo` |
-| `SOURCE_REPO_PAT` | secret | 读取源码仓库 |
-| `ANDROID_KEYSTORE_BASE64` 等 | secret | 正式 APK 签名；未配置时使用一次性临时签名 |
+| `RELEASE_SOURCE_REPO` | secret | 私有源码仓库 `owner/repo`，用于 checkout 和发布 |
+| `RELEASE_SOURCE_REPO_PAT` | secret | 仅限上述私库的 Contents 读写权限 |
+| `MOBILE_APP_FLAVOR` | secret | 源码的 Expo 品牌档案 |
+| `ANDROID_PACKAGE_NAME` | secret | Android 签名包标识 |
+| `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` | secret | 正式 APK 签名材料 |
 | `GOOGLE_SERVICES_PROD_JSON_BASE64` | secret | Android 推送配置（可选） |
-| `ASC_API_KEY_P8_BASE64` / `ASC_KEY_ID` / `ASC_ISSUER_ID` | secret | iOS TestFlight 上传 |
+| `ASC_API_KEY_P8_BASE64` / `ASC_KEY_ID` / `ASC_ISSUER_ID` | secret | iOS 自动构建号和 TestFlight 上传 |
 | `IOS_DISTRIBUTION_CERT_BASE64` / `IOS_CERT_PASSWORD` / `IOS_KEYCHAIN_PASSWORD` | secret | iOS 签名证书 |
 | `IOS_PROFILE_APP_BASE64` / `IOS_PROFILE_WIDGET_BASE64` | secret | iOS Provisioning Profile |
 | `IOS_PROJECT_NAME` / `IOS_SCHEME` / `IOS_APP_TARGET` / `IOS_WIDGET_TARGET` | secret | iOS 工程信息 |
 | `IOS_APP_BUNDLE_ID` / `IOS_WIDGET_BUNDLE_ID` / `APPLE_TEAM_ID` | secret | iOS 签名身份 |
 | `FEISHU_RELEASE_WEBHOOK_URL` / `FEISHU_RELEASE_WEBHOOK_SECRET` | secret/variable | 构建通知（可选） |
-| `MOBILE_ARTIFACT_PREFIX` | variable | 产物文件名前缀，默认 `mobile-app` |
-| `RELEASE_TAG_PREFIX` | variable | Release tag 前缀，默认取平台名 |
+| `MOBILE_ARTIFACT_PREFIX` | secret 或 variable | 产物文件名前缀，默认 `mobile-app` |
+| `RELEASE_TAG_PREFIX` | secret 或 variable | Release tag 的可选产品前缀 |
+| `SENTRY_AUTH_TOKEN` | secret | 源码映射上传 |
+| `ANDROID_VERSION_CODE_BASE` | variable | 自动 versionCode 基数，默认 `0`。首次 Actions 运行从 `1` 开始 |
+| `RELEASE_OSS_ENABLED` | secret | 设为 `true` 启用 OSS 私有备份 |
+| `RELEASE_OSS_BUCKET` / `RELEASE_OSS_REGION` / `RELEASE_OSS_PREFIX` | secret | 私有桶、地域和独立对象前缀 |
+| `RELEASE_OSS_ENDPOINT` | secret | 可选 HTTPS 自定义 OSS 域名；默认使用地域外网 endpoint |
+| `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` | secret | 限定备份对象前缀的 RAM 凭据，需要 `oss:PutObject` 和 `oss:GetObject` |
 | `OTA_ENV_PREFIX` | variable | OTA 环境变量前缀，如 `APP_`（需与源码 App 约定一致） |
 | `OTA_UPDATE_URL` | variable | Expo 更新地址 |
 | `OTA_APP_TITLE` / `OTA_APP_ID` | variable | 发布目标 App 标识 |
@@ -73,8 +81,7 @@ gh workflow run mobile-ios-release.yml -f ref=<source-ref>
 | `OTA_TARGET_GLOBAL` / `OTA_TARGET_CN` | variable | 源码 App 的 OTA target 名称 |
 | `EXPO_TOKEN` | secret | EAS 发布令牌 |
 
-Android 未配置正式 keystore 时会生成仅本次运行有效的临时 keystore：能安装、能互相覆盖，
-但跨运行升级需要卸载重装。正式分发前请配置 `ANDROID_KEYSTORE_*`。
+Android 需要完整的正式签名材料。启用 OSS 后，备份对象保持私有，地址按环境、平台、Release tag 和文件摘要区分。签名链接只写入私库的下载清单。
 
 ## 本地校验
 

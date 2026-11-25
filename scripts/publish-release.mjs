@@ -10,7 +10,8 @@ import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildReleaseTag } from './lib/release.mjs';
+import { buildReleaseTag, privateReleasePrefix } from './lib/release.mjs';
+import { backupToOss, OSS_DOWNLOAD_MANIFEST, readOssSettings } from './release-oss.mjs';
 
 const PLATFORM_LABEL = { android: 'Android', ios: 'iOS' };
 
@@ -27,7 +28,7 @@ function writeOutput(name, value) {
 function readSummaries(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
-    .filter((file) => file.endsWith('.json'))
+    .filter((file) => file.endsWith('.json') && file !== OSS_DOWNLOAD_MANIFEST)
     .sort()
     .map((file) => ({ file, path: path.join(dir, file), data: JSON.parse(readFileSync(path.join(dir, file), 'utf8')) }));
 }
@@ -63,6 +64,7 @@ export function planRelease({ summaries, expectedTargets = [], tagPrefix = '' })
 }
 
 export function releaseAssets({ dir, summary, exists = existsSync }) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*\.(apk|ipa)$/.test(summary.artifactName)) return null;
   const artifactPath = path.join(dir, summary.artifactName);
   if (!exists(artifactPath)) return null;
   const assets = [artifactPath];
@@ -97,11 +99,27 @@ function gh(args) {
   return result.status ?? 1;
 }
 
-function main() {
+//#region 私有 Release 发布
+
+function capture(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8', stdio: 'pipe' });
+  if (result.status !== 0) fail(`${command} 操作失败`);
+  return result.stdout.trim();
+}
+
+function viewReleaseAssets(repo, tag) {
+  return spawnSync('gh', ['release', 'view', tag, '--repo', repo, '--json', 'assets'], {
+    encoding: 'utf8',
+    stdio: 'pipe',
+  });
+}
+
+async function main() {
   const dir = process.env.RELEASE_SUMMARIES_DIR?.trim() || '.private/artifacts';
   const tagPrefix = process.env.RELEASE_TAG_PREFIX?.trim() || '';
   const upload = (process.env.UPLOAD_RELEASE ?? 'true').trim() !== 'false';
-  const repo = process.env.GITHUB_REPOSITORY?.trim() || '';
+  const oss = upload ? readOssSettings(process.env) : null;
+  const repo = process.env.RELEASE_SOURCE_REPO?.trim() || '';
 
   const entries = readSummaries(dir);
   const summaries = entries.map((entry) => entry.data);
@@ -110,11 +128,14 @@ function main() {
     .map((item) => item.trim())
     .filter(Boolean);
 
-  const plan = planRelease({ summaries, expectedTargets, tagPrefix });
+  const releaseEnv = process.env.RELEASE_RELEASE_ENV?.trim() || 'production';
+  const prefix = privateReleasePrefix({ tagPrefix, releaseEnv, platform: summaries[0]?.platform });
+  const plan = planRelease({ summaries, expectedTargets, tagPrefix: prefix });
   if (plan.skipped) {
     writeOutput('release_url', '');
     writeOutput('tag', '');
     writeOutput('uploaded', 'false');
+    if (upload) fail(plan.reason);
     console.log(`[release] skipped: ${plan.reason}`);
     return;
   }
@@ -127,49 +148,65 @@ function main() {
   if (!upload) {
     console.log('[release] UPLOAD_RELEASE=false，跳过 GitHub Release 上传');
   } else {
-    if (!repo) fail('GITHUB_REPOSITORY 缺失');
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) fail('RELEASE_SOURCE_REPO 缺失或非法');
     if (!process.env.GH_TOKEN) fail('GH_TOKEN 缺失');
-
-    const view = spawnSync('gh', ['release', 'view', plan.tag, '--repo', repo, '--json', 'tagName'], {
-      encoding: 'utf8',
-      stdio: 'pipe',
+    if (capture('gh', ['api', `repos/${repo}`, '--jq', '.private']) !== 'true') {
+      fail('签名产物只允许写入私有源码仓库');
+    }
+    const sha = capture('git', ['-C', 'source', 'rev-parse', 'HEAD']);
+    if (!/^[a-f0-9]{40}$/.test(sha)) fail('无法确认实际构建的源码提交');
+    const assets = entries.flatMap((entry) => {
+      const found = releaseAssets({ dir, summary: entry.data });
+      if (!found) fail(`签名产物缺失：${entry.file}`);
+      return found;
     });
+    const notes = buildReleaseNotes({
+      platform, sourceRepo: repo, ref: process.env.RELEASE_REF ?? '', releaseEnv, summaries, signingMode,
+    });
+
+    let view = viewReleaseAssets(repo, plan.tag);
     if ((view.status ?? 1) !== 0) {
-      const notes = buildReleaseNotes({
-        platform,
-        sourceRepo: process.env.RELEASE_SOURCE_REPO ?? '',
-        ref: process.env.RELEASE_REF ?? '',
-        releaseEnv: process.env.RELEASE_RELEASE_ENV ?? '',
-        summaries,
-        signingMode,
-      });
       const status = gh([
         'release', 'create', plan.tag,
         '--repo', repo,
+        '--target', sha,
+        '--latest=false',
+        ...(releaseEnv === 'test' ? ['--prerelease'] : []),
         '--title', `${PLATFORM_LABEL[platform] ?? platform} ${plan.version} (${plan.buildNumber})`,
         '--notes', notes,
       ]);
       if (status !== 0) {
-        // 并发任务可能刚创建同名 release：再确认一次，存在则继续上传。
-        const recheck = spawnSync('gh', ['release', 'view', plan.tag, '--repo', repo, '--json', 'tagName'], {
-          encoding: 'utf8',
-          stdio: 'pipe',
-        });
-        if ((recheck.status ?? 1) !== 0) fail(`创建 release 失败：${plan.tag}`);
+        view = viewReleaseAssets(repo, plan.tag);
+        if ((view.status ?? 1) !== 0) fail(`创建 release 失败：${plan.tag}`);
         console.log('[release] release 已由并发任务创建，继续上传产物');
       }
     }
 
-    for (const entry of entries) {
-      const assets = releaseAssets({ dir, summary: entry.data });
-      if (!assets) {
-        console.warn(`[release] 跳过缺失产物：${entry.data.artifactName}`);
-        continue;
-      }
-      const status = gh(['release', 'upload', plan.tag, '--repo', repo, '--clobber', ...assets]);
-      if (status !== 0) fail(`上传产物失败：${entry.file}`);
+    const tagSha = capture('gh', ['api', `repos/${repo}/commits/${encodeURIComponent(plan.tag)}`, '--jq', '.sha']);
+    if (tagSha !== sha) {
+      fail('已有 Release tag 指向不同源码提交');
     }
+    // 重打包可能改变文件摘要。替换安装包前先撤下旧 OSS 清单。
+    const previousAssets = view.status === 0 ? JSON.parse(view.stdout).assets : [];
+    if (previousAssets.some((asset) => asset.name === OSS_DOWNLOAD_MANIFEST)) {
+      const removed = gh(['release', 'delete-asset', plan.tag, OSS_DOWNLOAD_MANIFEST, '--repo', repo, '--yes']);
+      if (removed !== 0) fail('移除上次构建的 OSS 下载清单失败');
+    }
+    const status = gh(['release', 'upload', plan.tag, '--repo', repo, '--clobber', ...assets]);
+    if (status !== 0) fail('上传签名产物失败');
+    writeOutput('uploaded', 'true');
     console.log(`[release] release 已更新：${releaseUrl}`);
+    if (view.status === 0 && gh(['release', 'edit', plan.tag, '--repo', repo, '--notes', notes]) !== 0) {
+      fail('刷新 Release 校验信息失败');
+    }
+    if (oss) {
+      const manifest = await backupToOss({ settings: oss, releaseEnv, platform, tag: plan.tag, entries: summaries, dir });
+      const manifestPath = path.join(dir, OSS_DOWNLOAD_MANIFEST);
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+      const manifestUpload = gh(['release', 'upload', plan.tag, '--repo', repo, '--clobber', manifestPath]);
+      if (manifestUpload !== 0) fail('上传私有 OSS 下载清单失败');
+      console.log('[release] OSS 备份已完成，临时下载清单已写入私有 Release');
+    }
   }
 
   for (const entry of entries) {
@@ -179,13 +216,15 @@ function main() {
 
   writeOutput('release_url', upload ? releaseUrl : '');
   writeOutput('tag', plan.tag);
-  writeOutput('uploaded', String(upload));
+  if (!upload) writeOutput('uploaded', 'false');
   writeOutput('platform', platform);
 }
 
+//#endregion
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    main();
+    await main();
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }

@@ -9,12 +9,18 @@ on:
         description: '源码仓库 ref（branch/tag/commit）'
         required: true
         type: string
+      release_env:
+        description: '运行时后端环境'
+        required: true
+        type: choice
+        default: test
+        options: [test, production]
       version:
         description: '可选 semver 覆盖；留空读取源码 app.config.ts'
         required: false
         type: string
       build_number:
-        description: '可选 CFBundleVersion；留空按分钟单调生成'
+        description: '可选 CFBundleVersion；留空查询 App Store Connect'
         required: false
         type: string
       build_number_offset:
@@ -43,28 +49,28 @@ on:
         default: false
         type: boolean
   repository_dispatch:
-    types: [ios-release]
+    types: [mobile-ios-release, ios-release]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-release-${{ github.event.client_payload.ref || inputs.ref }}
-  cancel-in-progress: true
+  group: ios-distribution
+  cancel-in-progress: false
 
 env:
-  SOURCE_REPO: ${{ vars.SOURCE_REPO || secrets.SOURCE_REPO }}
+  SOURCE_REPO: ${{ secrets.RELEASE_SOURCE_REPO }}
   MOBILE_PLATFORM: ios
   MOBILE_SOURCE_REF: ${{ github.event.client_payload.ref || inputs.ref }}
   MOBILE_TARGET: production
-  MOBILE_RELEASE_ENV: production
+  MOBILE_RELEASE_ENV: ${{ github.event.client_payload.release_env || inputs.release_env || 'test' }}
   MOBILE_VERSION: ${{ github.event.client_payload.version || inputs.version }}
   MOBILE_BUILD_NUMBER: ${{ github.event.client_payload.build_number || inputs.build_number }}
   MOBILE_BUILD_NUMBER_OFFSET: ${{ github.event.client_payload.build_number_offset || inputs.build_number_offset || '0' }}
-  MOBILE_ARTIFACT_PREFIX: ${{ vars.MOBILE_ARTIFACT_PREFIX || 'mobile-app' }}
-  RELEASE_TAG_PREFIX: ${{ vars.RELEASE_TAG_PREFIX }}
-  SUBMIT_TO_STORE: ${{ github.event.client_payload.submit == false && 'false' || (github.event.client_payload.submit == true && 'true' || inputs.submit) }}
-  UPLOAD_RELEASE: ${{ github.event.client_payload.upload_release == false && 'false' || (github.event.client_payload.upload_release == true && 'true' || inputs.upload_release) }}
+  MOBILE_ARTIFACT_PREFIX: ${{ secrets.MOBILE_ARTIFACT_PREFIX || vars.MOBILE_ARTIFACT_PREFIX || 'mobile-app' }}
+  RELEASE_TAG_PREFIX: ${{ secrets.RELEASE_TAG_PREFIX || vars.RELEASE_TAG_PREFIX }}
+  SUBMIT_TO_STORE: ${{ (toJSON(github.event.client_payload.submit) == 'true' || (github.event_name == 'workflow_dispatch' && inputs.submit == true)) && 'true' || 'false' }}
+  UPLOAD_RELEASE: ${{ (toJSON(github.event.client_payload.upload_private_release) == 'false' || github.event.client_payload.upload_private_release == 'false' || toJSON(github.event.client_payload.upload_release) == 'false') && 'false' || (github.event_name == 'workflow_dispatch' && inputs.upload_release == false && 'false' || 'true') }}
   IOS_TESTFLIGHT_CHANGELOG: ${{ github.event.client_payload.what_to_test || inputs.what_to_test || 'Mobile app build' }}
   CLEAR_CACHE: ${{ github.event.client_payload.clear_cache || inputs.clear_cache }}
 
@@ -100,14 +106,23 @@ jobs:
 
       - name: Resolve release inputs
         id: resolve
+        env:
+          IOS_APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
         run: node scripts/resolve-release.mjs
 
   build:
     needs: prepare
     runs-on: macos-26
     timeout-minutes: 120
+    outputs:
+      version: ${{ steps.build_env.outputs.BUILD_VERSION }}
+      uploaded: ${{ steps.release.outputs.uploaded }}
     env:
       EXPO_NO_DOTENV: '1'
+      EXPO_PUBLIC_APP_FLAVOR: ${{ secrets.MOBILE_APP_FLAVOR }}
       EXPO_PUBLIC_APP_CHANNEL: production
       EXPO_PUBLIC_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
     steps:
@@ -116,20 +131,22 @@ jobs:
 
       - name: Validate source repo configuration
         env:
-          SOURCE_REPO_PAT: ${{ secrets.SOURCE_REPO_PAT }}
+          GH_TOKEN: ${{ secrets.RELEASE_SOURCE_REPO_PAT }}
         run: |
           set -euo pipefail
-          test -n "${SOURCE_REPO:-}" || { echo "SOURCE_REPO 未配置（仓库 variable 或 secret）" >&2; exit 1; }
-          test -n "${SOURCE_REPO_PAT:-}" || { echo "SOURCE_REPO_PAT secret 必填（用于读取源码仓库）" >&2; exit 1; }
+          test -n "$SOURCE_REPO" || { echo "RELEASE_SOURCE_REPO Secret is required" >&2; exit 1; }
+          test -n "$GH_TOKEN" || { echo "RELEASE_SOURCE_REPO_PAT Secret is required" >&2; exit 1; }
+          test "$(gh api "repos/$SOURCE_REPO" --jq .private)" = true || { echo "Release source repository must be private" >&2; exit 1; }
 
       - name: Checkout source app
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ needs.prepare.outputs.source_ref }}
-          token: ${{ secrets.SOURCE_REPO_PAT }}
+          token: ${{ secrets.RELEASE_SOURCE_REPO_PAT }}
           path: source
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Prepare shared mobile dependencies
         uses: ./.github/actions/prepare-mobile
@@ -155,8 +172,16 @@ jobs:
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
         run: node scripts/prepare-build-env.mjs
 
+      - name: Verify Expo release configuration
+        working-directory: source/apps/mobile
+        env:
+          EXPECTED_APP_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+        run: bunx expo config --type public --json | node ../../../scripts/verify-release-config.mjs ios
+
       - name: Generate iOS native project
         working-directory: source/apps/mobile
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: bunx expo prebuild --platform ios --clean --no-install
 
       - name: Update iOS native version
@@ -191,6 +216,7 @@ jobs:
 
       - name: Build signed IPA
         env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           MOBILE_APP_ROOT: ${{ github.workspace }}/source/apps/mobile
           IOS_OUTPUT_DIR: ${{ github.workspace }}/.private/artifacts
           IOS_BUILD_LOG_DIR: ${{ runner.temp }}/gym-logs
@@ -209,32 +235,6 @@ jobs:
         run: |
           mkdir -p .private/artifacts "$IOS_BUILD_LOG_DIR" "$IOS_DERIVED_DATA_PATH"
           bundle exec fastlane ios build_ipa
-
-      - name: Print iOS build logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          for dir in "$RUNNER_TEMP/gym-logs" "$HOME/Library/Logs/gym"; do
-            [ -d "$dir" ] || continue
-            echo "::group::${dir}"
-            find "$dir" -type f -name '*.log' -print0 | while IFS= read -r -d '' file; do
-              echo "----- ${file}"
-              tail -n 240 "$file"
-            done
-            echo "::endgroup::"
-          done
-
-      - name: Upload iOS failure logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-build-logs
-          path: |
-            ${{ runner.temp }}/gym-logs
-            ~/Library/Logs/gym
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Collect IPA artifact
         shell: bash
@@ -269,14 +269,22 @@ jobs:
 
           ls -lh .private/artifacts
 
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ipa-${{ needs.prepare.outputs.target }}
-          path: .private/artifacts/*
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
+      - name: Publish signed package to the private source repository
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SOURCE_REPO_PAT }}
+          RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
+          RELEASE_REF: ${{ needs.prepare.outputs.source_ref }}
+          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
+          RELEASE_EXPECTED_TARGETS: ${{ needs.prepare.outputs.target }}
+          RELEASE_OSS_ENABLED: ${{ secrets.RELEASE_OSS_ENABLED }}
+          RELEASE_OSS_BUCKET: ${{ secrets.RELEASE_OSS_BUCKET }}
+          RELEASE_OSS_REGION: ${{ secrets.RELEASE_OSS_REGION }}
+          RELEASE_OSS_PREFIX: ${{ secrets.RELEASE_OSS_PREFIX }}
+          RELEASE_OSS_ENDPOINT: ${{ secrets.RELEASE_OSS_ENDPOINT }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: node scripts/publish-release.mjs
 
       - name: Upload IPA to App Store Connect / TestFlight
         if: env.SUBMIT_TO_STORE == 'true'
@@ -294,56 +302,13 @@ jobs:
           rm -rf .private
           security delete-keychain "${{ steps.signing.outputs.keychain_path }}" || true
 
-  finish:
+  notify:
     needs: [prepare, build]
     if: always()
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      release_url: ${{ steps.release.outputs.release_url }}
-      tag: ${{ steps.release.outputs.tag }}
-      uploaded: ${{ steps.release.outputs.uploaded }}
     steps:
       - name: Checkout pipeline repo
         uses: actions/checkout@v4
-
-      - name: Download IPA artifacts
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ipa-*
-          path: .private/artifacts
-          merge-multiple: true
-
-      - name: Publish GitHub release
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPLOAD_RELEASE: ${{ env.UPLOAD_RELEASE }}
-          RELEASE_SUMMARIES_DIR: .private/artifacts
-          RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
-          RELEASE_REF: ${{ needs.prepare.outputs.source_ref }}
-          RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
-          RELEASE_EXPECTED_TARGETS: ${{ needs.prepare.outputs.target }}
-          RELEASE_TAG_PREFIX: ${{ env.RELEASE_TAG_PREFIX }}
-        run: node scripts/publish-release.mjs
-
-  notify:
-    needs: [prepare, build, finish]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout pipeline repo
-        uses: actions/checkout@v4
-
-      - name: Download IPA artifacts
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ipa-*
-          path: .private/artifacts
-          merge-multiple: true
 
       - name: Notify Feishu release bot
         env:
@@ -354,14 +319,11 @@ jobs:
           RELEASE_PLATFORM: ios
           RELEASE_REF: ${{ needs.prepare.outputs.source_ref || env.MOBILE_SOURCE_REF }}
           RELEASE_SOURCE_REPO: ${{ env.SOURCE_REPO }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version || env.MOBILE_VERSION }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version || needs.prepare.outputs.version || env.MOBILE_VERSION }}
           RELEASE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number || env.MOBILE_BUILD_NUMBER }}
           RELEASE_TARGETS: ${{ needs.prepare.outputs.target }}
           RELEASE_RELEASE_ENV: ${{ needs.prepare.outputs.release_env }}
-          RELEASE_URL: ${{ needs.finish.outputs.release_url }}
-          RELEASE_TAG: ${{ needs.finish.outputs.tag }}
-          RELEASE_UPLOADED: ${{ needs.finish.outputs.uploaded }}
+          RELEASE_UPLOADED: ${{ needs.build.outputs.uploaded }}
           RELEASE_PIPELINE_REPO: ${{ github.repository }}
           RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RELEASE_SUMMARIES_DIR: .private/artifacts
         run: node scripts/notify-feishu-release.mjs

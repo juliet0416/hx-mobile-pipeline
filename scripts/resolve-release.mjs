@@ -4,8 +4,8 @@
  * 解析单次移动端发布的构建输入，输出 GitHub Actions outputs。
  *
  * 设计原则：
- * - 一次运行只构建一个目标（Android: cn / global，iOS: production）；
- * - 不访问 Google Play / App Store，构建号由调用方显式给出或按分钟单调生成；
+ * - 一次运行只构建一份 IPA 或直装 APK；
+ * - iOS 自动查询 App Store Connect，Android 在 CI 中使用构建号基数加运行号；
  * - 业务地址不写死在流水线里，由输入或仓库变量提供。
  */
 
@@ -13,6 +13,7 @@ import { appendFileSync } from 'node:fs';
 
 import {
   parseBuildNumberOffset,
+  parseBuildNumber,
   parsePlatform,
   parseReleaseEnv,
   parseSemver,
@@ -20,6 +21,7 @@ import {
   resolveBuildNumber,
   resolveRegion,
 } from './lib/release.mjs';
+import { resolveStoreBuildNumber } from './resolve-store-build-number.mjs';
 
 function readEnv(name, fallback = '') {
   return process.env[name]?.trim() || fallback;
@@ -39,9 +41,11 @@ function writeOutputs(values) {
   }
 }
 
-function main() {
+async function main() {
   const sourceRef = readEnv('MOBILE_SOURCE_REF');
-  if (!sourceRef) fail('MOBILE_SOURCE_REF 必填（源码仓库的 branch/tag/commit）');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(sourceRef)) {
+    fail('MOBILE_SOURCE_REF 必须是有效的源码 branch/tag/commit');
+  }
 
   let platform;
   let target;
@@ -51,16 +55,31 @@ function main() {
   try {
     platform = parsePlatform(readEnv('MOBILE_PLATFORM', 'android'));
     target = parseTarget(readEnv('MOBILE_TARGET', platform === 'ios' ? 'production' : ''), platform);
-    releaseEnv = parseReleaseEnv(readEnv('MOBILE_RELEASE_ENV'), platform);
-    buildNumber = resolveBuildNumber({
-      explicit: readEnv('MOBILE_BUILD_NUMBER'),
-      offset: parseBuildNumberOffset(readEnv('MOBILE_BUILD_NUMBER_OFFSET', '0')),
-    });
+    releaseEnv = parseReleaseEnv(readEnv('MOBILE_RELEASE_ENV'));
+    const explicit = readEnv('MOBILE_BUILD_NUMBER');
+    const offset = parseBuildNumberOffset(readEnv('MOBILE_BUILD_NUMBER_OFFSET', '0'));
+    const runNumber = readEnv('GITHUB_RUN_NUMBER');
+    if (explicit) {
+      buildNumber = parseBuildNumber(explicit);
+    } else if (platform === 'ios') {
+      buildNumber = parseBuildNumber(await resolveStoreBuildNumber({ platform, offset }));
+    } else if (runNumber) {
+      const base = parseBuildNumberOffset(readEnv('ANDROID_VERSION_CODE_BASE', '0'));
+      buildNumber = parseBuildNumber(base + Number(parseBuildNumber(runNumber)) + offset);
+    } else {
+      buildNumber = resolveBuildNumber({ offset });
+    }
     const versionInput = readEnv('MOBILE_VERSION');
     if (versionInput) version = parseSemver(versionInput);
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
+
+  if (platform === 'android' && (
+    readEnv('MOBILE_ARTIFACT_TYPE', 'apk') !== 'apk'
+    || !['null', 'false', '"false"'].includes(readEnv('MOBILE_SUBMIT', 'null'))
+    || !['null', '[]'].includes(readEnv('MOBILE_RELEASE_ITEMS', 'null'))
+  )) fail('Android 发布仅支持单个直装 APK');
 
   // 业务地址只从输入或仓库变量读取：<INPUT> 优先，其次 MOBILE_<TARGET>_<KEY>。
   const targetKey = target.toUpperCase();
@@ -100,7 +119,7 @@ function main() {
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   fail(error instanceof Error ? error.message : String(error));
 }

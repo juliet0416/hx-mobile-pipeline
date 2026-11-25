@@ -5,7 +5,7 @@
  * 这里不包含任何业务方地址或包名，具体后端地址由 workflow 变量/输入提供。
  */
 
-export const ANDROID_TARGETS = ['cn', 'global'];
+export const ANDROID_TARGETS = ['cn', 'global', 'production'];
 export const IOS_TARGETS = ['production'];
 export const MAX_VERSION_CODE = 2100000000;
 
@@ -38,13 +38,10 @@ export function parseTarget(raw, platform) {
   return value;
 }
 
-export function parseReleaseEnv(raw, platform) {
+export function parseReleaseEnv(raw) {
   const value = trim(raw) || 'production';
   if (value !== 'production' && value !== 'test') {
     fail(`release_env 只能是 production 或 test，收到 "${raw}"`);
-  }
-  if (platform === 'ios' && value !== 'production') {
-    fail('iOS 目前只支持 release_env=production');
   }
   return value;
 }
@@ -52,6 +49,10 @@ export function parseReleaseEnv(raw, platform) {
 /** cn 需要区域标记；global 清空区域。 */
 export function resolveRegion(target) {
   return trim(target) === 'cn' ? 'cn' : '';
+}
+
+export function privateReleasePrefix({ tagPrefix, releaseEnv, platform }) {
+  return [trim(tagPrefix), trim(releaseEnv) || 'production', trim(platform)].filter(Boolean).join('-');
 }
 
 export function parseSemver(raw, label = 'version') {

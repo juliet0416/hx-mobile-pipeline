@@ -9,6 +9,7 @@ import { createHmac } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildReleaseTag, privateReleasePrefix } from './lib/release.mjs';
 
 const SUCCESS_RESULTS = new Set(['success', 'skipped']);
 const PLATFORM_LABEL = { android: 'Android APK', ios: 'iOS IPA' };
@@ -159,21 +160,30 @@ async function main() {
   const summaries = readReleaseSummaries(process.env.RELEASE_SUMMARIES_DIR);
   const version = process.env.RELEASE_VERSION?.trim() || summaries[0]?.version || '';
   const buildNumber = process.env.RELEASE_BUILD_NUMBER?.trim() || summaries[0]?.buildNumber || '';
+  const uploaded = process.env.RELEASE_UPLOADED === 'true';
+  const repo = process.env.RELEASE_SOURCE_REPO;
+  const releaseEnv = process.env.RELEASE_RELEASE_ENV;
+  const tag = uploaded ? buildReleaseTag({
+    prefix: privateReleasePrefix({ tagPrefix: process.env.RELEASE_TAG_PREFIX, releaseEnv, platform }),
+    platform,
+    version,
+    buildNumber,
+  }) : '';
 
   const payload = buildCard({
-    uploaded: process.env.RELEASE_UPLOADED === 'true',
+    uploaded,
     platform,
     buildNumber,
     ref: process.env.RELEASE_REF,
-    releaseEnv: process.env.RELEASE_RELEASE_ENV,
-    releaseUrl: process.env.RELEASE_URL,
-    repo: process.env.RELEASE_PIPELINE_REPO,
+    releaseEnv,
+    releaseUrl: tag && repo ? `https://github.com/${repo}/releases/tag/${tag}` : '',
+    repo,
     runUrl: process.env.RELEASE_RUN_URL,
     signingMode: process.env.RELEASE_SIGNING_MODE,
     sourceRepo: process.env.RELEASE_SOURCE_REPO,
     status,
     summaries,
-    tag: process.env.RELEASE_TAG,
+    tag,
     targets: (process.env.RELEASE_TARGETS ?? '').split(',').map((item) => item.trim()).filter(Boolean),
     version,
   });
