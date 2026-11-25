@@ -3,7 +3,14 @@ import { mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { backupToOss, readOssSettings } from './release-oss.mjs';
+import { backupToOss, describeOssObject, readOssSettings } from './release-oss.mjs';
+
+function downloadProbe(size) {
+  return async (_url, { headers }) => {
+    assert.equal(headers.Range, 'bytes=0-0');
+    return new Response('x', { status: 206, headers: { 'content-range': `bytes 0-0/${size}` } });
+  };
+}
 
 test('validates explicit private backup settings', () => {
   assert.equal(readOssSettings({}), null);
@@ -53,7 +60,7 @@ test('stores a signed APK privately and reuses a verified copy after an overwrit
         return url;
       },
     };
-    const manifest = await backupToOss({ ...opts, client });
+    const manifest = await backupToOss({ ...opts, client, fetchImpl: downloadProbe(5) });
     assert.deepEqual(manifest.files.map((file) => [file.key, file.url]), [[key, url]]);
     await assert.rejects(
       backupToOss({ ...opts, client: { ...client, head: async () => ({ meta: {} }) } }),
@@ -91,7 +98,7 @@ test('uploads large artifacts in private parts and verifies the completed object
       async signatureUrlV4() { return 'https://example.invalid/download'; },
       async abortMultipartUpload(key, uploadId) { aborted = { key, uploadId }; },
     };
-    const manifest = await backupToOss({ ...options, client });
+    const manifest = await backupToOss({ ...options, client, fetchImpl: downloadProbe(size) });
     assert.equal(manifest.files[0].sizeBytes, size);
     await assert.rejects(backupToOss({
       ...options,
@@ -107,4 +114,22 @@ test('uploads large artifacts in private parts and verifies the completed object
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('records a verified OSS backup without an unusable signed download link', async () => {
+  const sha256 = 'a'.repeat(64);
+  const file = await describeOssObject({
+    client: {
+      async head() { return { meta: { sha256 }, res: { headers: { 'content-length': '5' } } }; },
+      async signatureUrlV4() { return 'https://example.invalid/download'; },
+    },
+    key: 'private/app.apk',
+    artifactName: 'app.apk',
+    sha256,
+    size: 5,
+    fetchImpl: async () => new Response('<Error><Code>ApkDownloadForbidden</Code></Error>', { status: 400 }),
+  });
+  assert.deepEqual(file, {
+    fileName: 'app.apk', key: 'private/app.apk', sha256, sizeBytes: 5, downloadError: 'ApkDownloadForbidden',
+  });
 });

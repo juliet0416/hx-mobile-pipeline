@@ -205,7 +205,10 @@ async function main() {
       writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
       const manifestUpload = gh(['release', 'upload', plan.tag, '--repo', repo, '--clobber', manifestPath]);
       if (manifestUpload !== 0) fail('上传私有 OSS 下载清单失败');
-      console.log('[release] OSS 备份已完成，临时下载清单已写入私有 Release');
+      console.log('[release] OSS 备份已完成，备份清单已写入私有 Release');
+      for (const { downloadError } of manifest.files) {
+        if (downloadError) console.warn(`[release] OSS 下载链接暂不可用（${downloadError}），请从私库 Release 下载`);
+      }
     }
   }
 

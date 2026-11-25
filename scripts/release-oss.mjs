@@ -81,9 +81,36 @@ async function uploadObject(client, key, file, size, sha256) {
   }
 }
 
-export async function backupToOss({ settings, releaseEnv, platform, tag, entries, dir, client = createClient(settings) }) {
+export async function describeOssObject({ client, key, artifactName, sha256, size, fetchImpl = fetch }) {
+  const stored = await client.head(key);
+  if (stored.meta?.sha256 !== sha256 || Number(stored.res?.headers?.['content-length']) !== size) {
+    throw new Error('OSS 对象与待备份产物不一致');
+  }
   const expiresSeconds = 604_800;
   const expiresAt = new Date(Date.now() + expiresSeconds * 1000).toISOString();
+  const entry = { fileName: artifactName, key, sha256, sizeBytes: size };
+  try {
+    const url = await client.signatureUrlV4('GET', expiresSeconds, undefined, key);
+    const response = await fetchImpl(url, {
+      headers: { Range: 'bytes=0-0' },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (response.status === 400) {
+      const forbidden = /<Code>ApkDownloadForbidden<\/Code>/.test(await response.text());
+      return { ...entry, downloadError: forbidden ? 'ApkDownloadForbidden' : 'HTTP 400' };
+    }
+    await response.body?.cancel();
+    if ((response.status === 206 && response.headers.get('content-range') === `bytes 0-0/${size}`)
+      || (response.status === 200 && Number(response.headers.get('content-length')) === size)) {
+      return { ...entry, expiresAt, url };
+    }
+    return { ...entry, downloadError: `HTTP ${response.status}` };
+  } catch (error) {
+    return { ...entry, downloadError: uploadErrorLabel(error) };
+  }
+}
+
+export async function backupToOss({ settings, releaseEnv, platform, tag, entries, dir, client = createClient(settings), fetchImpl = fetch }) {
   const files = [];
   for (const { artifactName, sha256 } of entries) {
     const expectedExtension = platform === 'ios' ? '.ipa' : '.apk';
@@ -98,13 +125,7 @@ export async function backupToOss({ settings, releaseEnv, platform, tag, entries
     const size = statSync(file).size;
     const key = `${settings.prefix}/${releaseEnv}/${platform}/${tag}/${sha256}/${artifactName}`;
     await uploadObject(client, key, file, size, sha256);
-    // 成功上传与同名重试都校验对象，再签发下载链接。
-    const stored = await client.head(key);
-    if (stored.meta?.sha256 !== sha256 || Number(stored.res?.headers?.['content-length']) !== size) {
-      throw new Error('OSS 对象与待备份产物不一致');
-    }
-    const url = await client.signatureUrlV4('GET', expiresSeconds, undefined, key);
-    files.push({ fileName: artifactName, key, sha256, sizeBytes: size, expiresAt, url });
+    files.push(await describeOssObject({ client, key, artifactName, sha256, size, fetchImpl }));
   }
   return { bucket: settings.bucket, region: settings.region, files };
 }
